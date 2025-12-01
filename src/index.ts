@@ -165,7 +165,9 @@ const XR_HAND_CAPTURE_RADIUS = 0.12;
 const XR_HAND_RELEASE_RADIUS = 0.18;
 const XR_HAND_APPROACH_MIN = 0.12;
 const XR_HAND_APPROACH_MAX = 0.45;
-const XR_HAND_VISUAL_SCALE = 3.2;
+const XR_HAND_VISUAL_SCALE = 6.0;
+const XR_HAND_RENDER_MARGIN = 0.6;
+const XR_PINCH_MAX_DISTANCE = 0.04;
 const HAND_LEFT_TINT = d.vec3f(1.0, 0.63, 0.5);
 const HAND_RIGHT_TINT = d.vec3f(0.5, 0.82, 1.0);
 
@@ -181,12 +183,15 @@ interface XrHandCandidate {
   score: number;
   handedness: XRHandedness;
   tipDistance: number;
+  withinBounds: boolean;
+  isPinching: boolean;
 }
 
 const xrHandInteraction = {
   dragX: null as number | null,
   activeHand: null as XRHandedness | null,
   lastSeenTime: 0,
+  isPinching: false,
 };
 
 const HandJointBuffer = d.struct({
@@ -896,8 +901,16 @@ const rayMarch = (rayOrigin: d.v3f, rayDirection: d.v3f, uv: d.v2f) => {
   const bbox = getSliderBbox();
   const zDepth = d.f32(0.25);
 
-  const sliderMin = d.vec3f(bbox.left, bbox.bottom, -zDepth);
-  const sliderMax = d.vec3f(bbox.right, bbox.top, zDepth);
+  const sliderMin = d.vec3f(
+    bbox.left - XR_HAND_RENDER_MARGIN,
+    bbox.bottom - XR_HAND_RENDER_MARGIN,
+    -zDepth - XR_HAND_RENDER_MARGIN,
+  );
+  const sliderMax = d.vec3f(
+    bbox.right + XR_HAND_RENDER_MARGIN,
+    bbox.top + XR_HAND_RENDER_MARGIN,
+    zDepth + XR_HAND_RENDER_MARGIN,
+  );
 
   const intersection = intersectBox(
     rayOrigin,
@@ -1259,6 +1272,7 @@ async function startXrSession() {
     xrHandInteraction.dragX = null;
     xrHandInteraction.activeHand = null;
     xrHandInteraction.lastSeenTime = 0;
+    xrHandInteraction.isPinching = false;
     commitHandJointUniform(0);
     sliderInputX = eventHandler.currentMouseX;
     if (xrButton) {
@@ -1278,6 +1292,7 @@ function onXrSessionEnded() {
   xrHandInteraction.dragX = null;
   xrHandInteraction.activeHand = null;
   xrHandInteraction.lastSeenTime = 0;
+  xrHandInteraction.isPinching = false;
   commitHandJointUniform(0);
   sliderInputX = eventHandler.currentMouseX;
   if (xrButton) {
@@ -1367,14 +1382,14 @@ function updateXrHandInteraction(
   if (!xrSession || !xrRefSpace || !frame.getJointPose) {
     commitHandJointUniform(0);
     if (time - xrHandInteraction.lastSeenTime > XR_HAND_RELEASE_MS) {
-      xrHandInteraction.dragX = null;
-      xrHandInteraction.activeHand = null;
+      releaseHandInteraction();
     }
     return xrHandInteraction.dragX;
   }
 
   let jointWriteIndex = 0;
   let bestCandidate: XrHandCandidate | null = null;
+  let activeCandidate: XrHandCandidate | null = null;
   for (const inputSource of xrSession.inputSources) {
     const { nextIndex, candidate } = collectHandSourceData(
       frame,
@@ -1383,62 +1398,83 @@ function updateXrHandInteraction(
     );
     jointWriteIndex = nextIndex;
 
-    if (
-      candidate &&
-      (
-        !bestCandidate ||
-        candidate.score < bestCandidate.score ||
-        (xrHandInteraction.activeHand === candidate.handedness &&
-          candidate.score <= bestCandidate.score + 1e-3)
-      )
-    ) {
-      bestCandidate = candidate;
+    if (candidate) {
+      if (!bestCandidate || candidate.score < bestCandidate.score) {
+        bestCandidate = candidate;
+      }
+      if (candidate.handedness === xrHandInteraction.activeHand) {
+        activeCandidate = candidate;
+      }
     }
   }
 
   commitHandJointUniform(jointWriteIndex);
 
-  if (bestCandidate) {
-    const sliderTipX = slider.tipX;
-    const tipDistance = bestCandidate.tipDistance;
-    const currentlyActive =
-      xrHandInteraction.activeHand === bestCandidate.handedness &&
-      xrHandInteraction.dragX !== null;
+  const isCurrentlyActive = xrHandInteraction.activeHand !== null &&
+    xrHandInteraction.dragX !== null;
+  const candidate = isCurrentlyActive
+    ? activeCandidate
+    : bestCandidate;
 
+  if (isCurrentlyActive && !candidate) {
+    if (time - xrHandInteraction.lastSeenTime > XR_HAND_RELEASE_MS) {
+      releaseHandInteraction();
+    }
+    return xrHandInteraction.dragX;
+  }
+
+  if (!candidate) {
+    if (time - xrHandInteraction.lastSeenTime > XR_HAND_RELEASE_MS) {
+      releaseHandInteraction();
+    }
+    return xrHandInteraction.dragX;
+  }
+
+  if (!candidate.isPinching) {
+    if (isCurrentlyActive) {
+      releaseHandInteraction();
+    }
+    return xrHandInteraction.dragX;
+  }
+
+  xrHandInteraction.lastSeenTime = time;
+
+  if (!isCurrentlyActive) {
     if (
-      tipDistance <= XR_HAND_CAPTURE_RADIUS ||
-      (currentlyActive && tipDistance <= XR_HAND_RELEASE_RADIUS)
+      !candidate.withinBounds ||
+      candidate.tipDistance > XR_HAND_CAPTURE_RADIUS
     ) {
-      const closeness = Math.max(
-        0,
-        1 - tipDistance / XR_HAND_CAPTURE_RADIUS,
-      );
-      const pullStrength = XR_HAND_APPROACH_MIN +
-        closeness * (XR_HAND_APPROACH_MAX - XR_HAND_APPROACH_MIN);
-      const desired = sliderTipX +
-        (bestCandidate.dragX - sliderTipX) * pullStrength;
-      const previous = xrHandInteraction.dragX ?? sliderTipX;
-      const smoothed = previous +
-        (desired - previous) * XR_HAND_SMOOTHING;
-
-      xrHandInteraction.dragX = smoothed;
-      xrHandInteraction.activeHand = bestCandidate.handedness;
-      xrHandInteraction.lastSeenTime = time;
       return xrHandInteraction.dragX;
     }
-
-    if (tipDistance > XR_HAND_RELEASE_RADIUS && currentlyActive) {
-      xrHandInteraction.activeHand = null;
-      xrHandInteraction.dragX = null;
-    }
+    xrHandInteraction.dragX = candidate.dragX;
+    xrHandInteraction.activeHand = candidate.handedness;
+    xrHandInteraction.isPinching = true;
+    return xrHandInteraction.dragX;
   }
 
-  if (time - xrHandInteraction.lastSeenTime > XR_HAND_RELEASE_MS) {
-    xrHandInteraction.dragX = null;
-    xrHandInteraction.activeHand = null;
-  }
+  const sliderTipX = slider.tipX;
+  const closeness = Math.max(
+    0,
+    1 - candidate.tipDistance / XR_HAND_CAPTURE_RADIUS,
+  );
+  const pullStrength = XR_HAND_APPROACH_MIN +
+    closeness * (XR_HAND_APPROACH_MAX - XR_HAND_APPROACH_MIN);
+  const desired = sliderTipX +
+    (candidate.dragX - sliderTipX) * pullStrength;
+  const previous = xrHandInteraction.dragX ?? sliderTipX;
+  const smoothed = previous +
+    (desired - previous) * XR_HAND_SMOOTHING;
 
+  xrHandInteraction.dragX = smoothed;
+  xrHandInteraction.activeHand = candidate.handedness;
+  xrHandInteraction.isPinching = true;
   return xrHandInteraction.dragX;
+}
+
+function releaseHandInteraction() {
+  xrHandInteraction.dragX = null;
+  xrHandInteraction.activeHand = null;
+  xrHandInteraction.isPinching = false;
 }
 
 type Vec3Tuple = [number, number, number];
@@ -1457,7 +1493,8 @@ function collectHandSourceData(
     return { nextIndex: writeIndex, candidate: null };
   }
 
-  let candidate: XrHandCandidate | null = null;
+  let candidatePoint: Vec3Tuple | null = null;
+  let thumbTipPoint: Vec3Tuple | null = null;
   const handedness = inputSource.handedness;
 
   for (const jointName of XR_HAND_JOINTS) {
@@ -1479,13 +1516,29 @@ function collectHandSourceData(
     const radius = jointPose.radius ?? 0.008;
     writeHandJointData(writeIndex, point, radius, handedness);
     if (jointName === XR_INTERACTION_JOINT) {
-      const maybeCandidate = createHandCandidateFromPoint(point, handedness);
-      if (maybeCandidate) {
-        candidate = maybeCandidate;
-      }
+      candidatePoint = point;
+    }
+    if (jointName === 'thumb-tip') {
+      thumbTipPoint = point;
     }
     writeIndex++;
   }
+
+  if (!candidatePoint) {
+    return { nextIndex: writeIndex, candidate: null };
+  }
+
+  let pinchDistance = Infinity;
+  if (thumbTipPoint) {
+    pinchDistance = distanceBetweenPoints(candidatePoint, thumbTipPoint);
+  }
+  const isPinching = pinchDistance < XR_PINCH_MAX_DISTANCE;
+
+  const candidate = createHandCandidateFromPoint(
+    candidatePoint,
+    handedness,
+    isPinching,
+  );
 
   return { nextIndex: writeIndex, candidate };
 }
@@ -1523,11 +1576,9 @@ function commitHandJointUniform(count: number) {
 function createHandCandidateFromPoint(
   point: Vec3Tuple,
   handedness: XRHandedness,
-): XrHandCandidate | null {
-  if (!pointWithinSliderBounds(point)) {
-    return null;
-  }
-
+  isPinching: boolean,
+): XrHandCandidate {
+  const withinBounds = pointWithinSliderBounds(point);
   const [top, , bottom] = bezierBbox;
   const sliderMidY = (top + bottom) * 0.5;
   const verticalRange = Math.max(0.001, top - bottom);
@@ -1543,6 +1594,8 @@ function createHandCandidateFromPoint(
     score,
     handedness,
     tipDistance,
+    withinBounds,
+    isPinching,
   };
 }
 
@@ -1555,6 +1608,13 @@ function pointWithinSliderBounds([x, y, z]: Vec3Tuple) {
     y <= top + XR_HAND_Y_MARGIN &&
     Math.abs(z) <= XR_HAND_Z_THRESHOLD
   );
+}
+
+function distanceBetweenPoints(a: Vec3Tuple, b: Vec3Tuple) {
+  const dx = a[0] - b[0];
+  const dy = a[1] - b[1];
+  const dz = a[2] - b[2];
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
 function mat4FromArrayLike(source: ArrayLike<number>) {
