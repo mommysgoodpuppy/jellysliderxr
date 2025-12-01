@@ -133,6 +133,25 @@ const xrSceneTransformInv = m.mat4.invert(
   m.mat4.identity(),
 ) ?? m.mat4.identity();
 
+const XR_INTERACTION_JOINT: XRHandJoint = 'index-finger-tip';
+const XR_HAND_Z_THRESHOLD = 0.1;
+const XR_HAND_X_MARGIN = 0.2;
+const XR_HAND_Y_MARGIN = 0.16;
+const XR_HAND_RELEASE_MS = 150;
+const XR_HAND_SMOOTHING = 0.35;
+
+interface XrHandCandidate {
+  dragX: number;
+  score: number;
+  handedness: XRHandedness;
+}
+
+const xrHandInteraction = {
+  dragX: null as number | null,
+  activeHand: null as XRHandedness | null,
+  lastSeenTime: 0,
+};
+
 const lightUniform = root.createUniform(DirectionalLight, {
   direction: std.normalize(d.vec3f(0.19, -0.24, 0.75)),
   color: d.vec3f(1, 1, 1),
@@ -898,6 +917,7 @@ const renderPipeline = root['~unstable']
   .createPipeline();
 
 const eventHandler = new EventHandler(canvas);
+let sliderInputX = eventHandler.currentMouseX;
 let lastTimeStamp = performance.now();
 let frameCount = 0;
 const taaResolver = new TAAResolver(root, width, height);
@@ -949,13 +969,20 @@ function getDeltaSeconds(timestamp: number) {
   return delta;
 }
 
-function updateSimulation(deltaTime: number) {
+function updateSimulation(deltaTime: number, overrideDragX?: number | null) {
   randomUniform.write(
     d.vec2f((Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2),
   );
 
   eventHandler.update();
-  slider.setDragX(eventHandler.currentMouseX);
+
+  if (typeof overrideDragX === 'number') {
+    sliderInputX = overrideDragX;
+  } else if (eventHandler.isPointerDown) {
+    sliderInputX = eventHandler.currentMouseX;
+  }
+
+  slider.setDragX(sliderInputX);
   slider.update(deltaTime);
 }
 
@@ -1064,6 +1091,7 @@ async function startXrSession() {
   try {
     const session = await navigator.xr.requestSession('immersive-vr', {
       requiredFeatures: ['webgpu'],
+      optionalFeatures: ['hand-tracking'],
     });
     xrSession = session;
     isPresentingXr = true;
@@ -1095,6 +1123,10 @@ async function startXrSession() {
     xrGpuBinding = null;
     xrProjectionLayer = null;
     isPresentingXr = false;
+    xrHandInteraction.dragX = null;
+    xrHandInteraction.activeHand = null;
+    xrHandInteraction.lastSeenTime = 0;
+    sliderInputX = eventHandler.currentMouseX;
     if (xrButton) {
       xrButton.disabled = false;
       xrButton.textContent = 'Enter VR';
@@ -1109,6 +1141,10 @@ function onXrSessionEnded() {
   xrGpuBinding = null;
   xrProjectionLayer = null;
   isPresentingXr = false;
+  xrHandInteraction.dragX = null;
+  xrHandInteraction.activeHand = null;
+  xrHandInteraction.lastSeenTime = 0;
+  sliderInputX = eventHandler.currentMouseX;
   if (xrButton) {
     xrButton.disabled = false;
     xrButton.textContent = 'Enter VR';
@@ -1133,7 +1169,8 @@ function onXrFrame(time: DOMHighResTimeStamp, frame: XRFrame) {
   }
 
   const deltaTime = getDeltaSeconds(time);
-  updateSimulation(deltaTime);
+  const handOverride = updateXrHandInteraction(frame, time);
+  updateSimulation(deltaTime, handOverride);
 
   const xrFormat = xrColorFormat ?? RAY_MARCH_FORMAT;
   const xrPipeline = getRayMarchPipeline(xrFormat);
@@ -1188,12 +1225,130 @@ function updateCameraFromXrView(view: XRView) {
   });
 }
 
+function updateXrHandInteraction(
+  frame: XRFrame,
+  time: DOMHighResTimeStamp,
+): number | null {
+  if (!xrSession || !xrRefSpace || !frame.getJointPose) {
+    if (time - xrHandInteraction.lastSeenTime > XR_HAND_RELEASE_MS) {
+      xrHandInteraction.dragX = null;
+      xrHandInteraction.activeHand = null;
+    }
+    return xrHandInteraction.dragX;
+  }
+
+  let bestCandidate: XrHandCandidate | null = null;
+  for (const inputSource of xrSession.inputSources) {
+    const candidate = getHandCandidate(frame, inputSource);
+    if (!candidate) {
+      continue;
+    }
+
+    if (
+      !bestCandidate ||
+      candidate.score < bestCandidate.score ||
+      (xrHandInteraction.activeHand === candidate.handedness &&
+        candidate.score <= bestCandidate.score + 1e-3)
+    ) {
+      bestCandidate = candidate;
+    }
+  }
+
+  if (bestCandidate) {
+    const previous = xrHandInteraction.dragX;
+    const smoothed = previous === null
+      ? bestCandidate.dragX
+      : previous + (bestCandidate.dragX - previous) * XR_HAND_SMOOTHING;
+    xrHandInteraction.dragX = smoothed;
+    xrHandInteraction.activeHand = bestCandidate.handedness;
+    xrHandInteraction.lastSeenTime = time;
+    return xrHandInteraction.dragX;
+  }
+
+  if (time - xrHandInteraction.lastSeenTime > XR_HAND_RELEASE_MS) {
+    xrHandInteraction.dragX = null;
+    xrHandInteraction.activeHand = null;
+  }
+
+  return xrHandInteraction.dragX;
+}
+
+function getHandCandidate(
+  frame: XRFrame,
+  inputSource: XRInputSource,
+): XrHandCandidate | null {
+  if (
+    !xrRefSpace ||
+    !inputSource.hand ||
+    inputSource.handedness === 'none' ||
+    !frame.getJointPose
+  ) {
+    return null;
+  }
+
+  const jointSpace = inputSource.hand.get(XR_INTERACTION_JOINT);
+  if (!jointSpace) {
+    return null;
+  }
+
+  const jointPose = frame.getJointPose(jointSpace, xrRefSpace);
+  if (!jointPose) {
+    return null;
+  }
+
+  const point = transformPoint(xrSceneTransformInv, jointPose.transform.position);
+  if (!pointWithinSliderBounds(point)) {
+    return null;
+  }
+
+  const [top, , bottom] = bezierBbox;
+  const sliderMidY = (top + bottom) * 0.5;
+  const verticalRange = Math.max(0.001, top - bottom);
+  const normalizedY = Math.abs(point[1] - sliderMidY) /
+    (verticalRange * 0.5 + XR_HAND_Y_MARGIN);
+  const normalizedZ = Math.abs(point[2]) / XR_HAND_Z_THRESHOLD;
+  const score = normalizedZ + normalizedY * 0.5;
+
+  return {
+    dragX: point[0],
+    score,
+    handedness: inputSource.handedness,
+  };
+}
+
+type Vec3Tuple = [number, number, number];
+
+function pointWithinSliderBounds([x, y, z]: Vec3Tuple) {
+  const [top, right, bottom, left] = bezierBbox;
+  return (
+    x >= left - XR_HAND_X_MARGIN &&
+    x <= right + XR_HAND_X_MARGIN &&
+    y >= bottom - XR_HAND_Y_MARGIN &&
+    y <= top + XR_HAND_Y_MARGIN &&
+    Math.abs(z) <= XR_HAND_Z_THRESHOLD
+  );
+}
+
 function mat4FromArrayLike(source: ArrayLike<number>) {
   const mat = d.mat4x4f();
   for (let i = 0; i < 16; i++) {
     mat[i] = source[i] ?? 0;
   }
   return mat;
+}
+
+function transformPoint(mat: m.Mat4, point: DOMPointReadOnly): Vec3Tuple {
+  const x = point.x;
+  const y = point.y;
+  const z = point.z;
+  const w = mat[3] * x + mat[7] * y + mat[11] * z + mat[15];
+  const invW = w && Number.isFinite(w) ? 1 / w : 1;
+
+  return [
+    (mat[0] * x + mat[4] * y + mat[8] * z + mat[12]) * invW,
+    (mat[1] * x + mat[5] * y + mat[9] * z + mat[13]) * invW,
+    (mat[2] * x + mat[6] * y + mat[10] * z + mat[14]) * invW,
+  ];
 }
 
 function identityMat4() {
