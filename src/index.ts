@@ -113,6 +113,26 @@ const camera = new CameraController(
 );
 const cameraUniform = camera.cameraUniform;
 
+const XR_SCENE_SCALE = 0.2;
+const XR_SCENE_TRANSLATION = [0, -0.5, -1.1] as const;
+const xrScaleMatrix = m.mat4.scaling(
+  [XR_SCENE_SCALE, XR_SCENE_SCALE, XR_SCENE_SCALE],
+  m.mat4.identity(),
+);
+const xrTranslationMatrix = m.mat4.translation(
+  XR_SCENE_TRANSLATION,
+  m.mat4.identity(),
+);
+const xrSceneTransform = m.mat4.mul(
+  xrTranslationMatrix,
+  xrScaleMatrix,
+  m.mat4.identity(),
+);
+const xrSceneTransformInv = m.mat4.invert(
+  xrSceneTransform,
+  m.mat4.identity(),
+) ?? m.mat4.identity();
+
 const lightUniform = root.createUniform(DirectionalLight, {
   direction: std.normalize(d.vec3f(0.19, -0.24, 0.75)),
   color: d.vec3f(1, 1, 1),
@@ -1137,8 +1157,20 @@ function onXrFrame(time: DOMHighResTimeStamp, frame: XRFrame) {
 }
 
 function updateCameraFromXrView(view: XRView) {
-  const viewMatrix = mat4FromArrayLike(view.transform.inverse.matrix);
-  const viewInvMatrix = mat4FromArrayLike(view.transform.matrix);
+  const baseView = view.transform.inverse.matrix;
+  const baseViewInv = view.transform.matrix;
+
+  const scaledView = m.mat4.mul(
+    baseView,
+    xrSceneTransform,
+    m.mat4.identity(),
+  );
+  const scaledViewInv = m.mat4.mul(
+    xrSceneTransformInv,
+    baseViewInv,
+    m.mat4.identity(),
+  );
+
   const projMatrix = mat4FromArrayLike(view.projectionMatrix);
   const invertedProj = m.mat4.invert(
     view.projectionMatrix,
@@ -1149,8 +1181,8 @@ function updateCameraFromXrView(view: XRView) {
     : identityMat4();
 
   cameraUniform.write({
-    view: viewMatrix,
-    viewInv: viewInvMatrix,
+    view: mat4FromArrayLike(scaledView),
+    viewInv: mat4FromArrayLike(scaledViewInv),
     proj: projMatrix,
     projInv: projInvMatrix,
   });
