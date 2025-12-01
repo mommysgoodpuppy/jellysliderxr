@@ -133,10 +133,46 @@ const xrSceneTransformInv = m.mat4.invert(
   m.mat4.identity(),
 ) ?? m.mat4.identity();
 
+const MAX_HAND_JOINTS = 50;
+const XR_HAND_JOINTS: XRHandJoint[] = [
+  'wrist',
+  'thumb-metacarpal',
+  'thumb-phalanx-proximal',
+  'thumb-phalanx-distal',
+  'thumb-tip',
+  'index-finger-metacarpal',
+  'index-finger-phalanx-proximal',
+  'index-finger-phalanx-intermediate',
+  'index-finger-phalanx-distal',
+  'index-finger-tip',
+  'middle-finger-metacarpal',
+  'middle-finger-phalanx-proximal',
+  'middle-finger-phalanx-intermediate',
+  'middle-finger-phalanx-distal',
+  'middle-finger-tip',
+  'ring-finger-metacarpal',
+  'ring-finger-phalanx-proximal',
+  'ring-finger-phalanx-intermediate',
+  'ring-finger-phalanx-distal',
+  'ring-finger-tip',
+  'pinky-finger-metacarpal',
+  'pinky-finger-phalanx-proximal',
+  'pinky-finger-phalanx-intermediate',
+  'pinky-finger-phalanx-distal',
+  'pinky-finger-tip',
+];
+const XR_HAND_CAPTURE_RADIUS = 0.12;
+const XR_HAND_RELEASE_RADIUS = 0.18;
+const XR_HAND_APPROACH_MIN = 0.12;
+const XR_HAND_APPROACH_MAX = 0.45;
+const XR_HAND_VISUAL_SCALE = 3.2;
+const HAND_LEFT_TINT = d.vec3f(1.0, 0.63, 0.5);
+const HAND_RIGHT_TINT = d.vec3f(0.5, 0.82, 1.0);
+
 const XR_INTERACTION_JOINT: XRHandJoint = 'index-finger-tip';
-const XR_HAND_Z_THRESHOLD = 0.1;
-const XR_HAND_X_MARGIN = 0.2;
-const XR_HAND_Y_MARGIN = 0.16;
+const XR_HAND_Z_THRESHOLD = 0.08;
+const XR_HAND_X_MARGIN = 0.12;
+const XR_HAND_Y_MARGIN = 0.12;
 const XR_HAND_RELEASE_MS = 150;
 const XR_HAND_SMOOTHING = 0.35;
 
@@ -144,6 +180,7 @@ interface XrHandCandidate {
   dragX: number;
   score: number;
   handedness: XRHandedness;
+  tipDistance: number;
 }
 
 const xrHandInteraction = {
@@ -151,6 +188,21 @@ const xrHandInteraction = {
   activeHand: null as XRHandedness | null,
   lastSeenTime: 0,
 };
+
+const HandJointBuffer = d.struct({
+  joints: d.arrayOf(d.vec4f, MAX_HAND_JOINTS),
+  count: d.u32,
+  padding: d.vec3f,
+});
+const handJointData = Array.from({ length: MAX_HAND_JOINTS }, () =>
+  d.vec4f(0, -10, 0, 0)
+);
+const handJointPadding = d.vec3f(0, 0, 0);
+const handJointsUniform = root.createUniform(HandJointBuffer, {
+  joints: handJointData,
+  count: d.u32(0),
+  padding: handJointPadding,
+});
 
 const lightUniform = root.createUniform(DirectionalLight, {
   direction: std.normalize(d.vec3f(0.19, -0.24, 0.75)),
@@ -320,20 +372,60 @@ const sliderApproxDist = (position: d.v3f) => {
   return dist3D;
 };
 
+const HandJointHit = d.struct({
+  distance: d.f32,
+  jointIndex: d.i32,
+});
+
+const getHandJointDistance = (position: d.v3f) => {
+  'use gpu';
+  const result = HandJointHit({
+    distance: d.f32(1e6),
+    jointIndex: d.i32(-1),
+  });
+  const jointCount = d.i32(handJointsUniform.$.count);
+
+  for (let i = 0; i < MAX_HAND_JOINTS; i++) {
+    if (i >= jointCount) {
+      break;
+    }
+    const joint = handJointsUniform.$.joints[i];
+    const radius = std.abs(joint.w);
+    if (radius <= 0) {
+      continue;
+    }
+    const dist = std.length(position.sub(joint.xyz)) - radius;
+    if (dist < result.distance) {
+      result.distance = dist;
+      result.jointIndex = i;
+    }
+  }
+
+  return result;
+};
+
 const getSceneDist = (position: d.v3f) => {
   'use gpu';
   const mainScene = getMainSceneDist(position);
   const poly3D = sliderSdf3D(position);
+  const handJoint = getHandJointDistance(position);
 
   const hitInfo = HitInfo();
 
-  if (poly3D.distance < mainScene) {
+  hitInfo.distance = mainScene;
+  hitInfo.objectType = ObjectType.BACKGROUND;
+  hitInfo.t = 0;
+
+  if (handJoint.jointIndex >= 0 && handJoint.distance < hitInfo.distance) {
+    hitInfo.distance = handJoint.distance;
+    hitInfo.objectType = ObjectType.HAND;
+    hitInfo.t = d.f32(handJoint.jointIndex);
+  }
+
+  if (poly3D.distance < hitInfo.distance) {
     hitInfo.distance = poly3D.distance;
     hitInfo.objectType = ObjectType.SLIDER;
     hitInfo.t = poly3D.t;
-  } else {
-    hitInfo.distance = mainScene;
-    hitInfo.objectType = ObjectType.BACKGROUND;
   }
   return hitInfo;
 };
@@ -744,6 +836,43 @@ const renderBackground = (
   );
 };
 
+const renderHandJoint = (
+  hitPosition: d.v3f,
+  hitInfo: d.Infer<typeof HitInfo>,
+  rayOrigin: d.v3f,
+) => {
+  'use gpu';
+  let jointIndex = d.i32(std.floor(hitInfo.t + 0.5));
+  if (jointIndex < 0) {
+    jointIndex = 0;
+  }
+  if (jointIndex >= MAX_HAND_JOINTS) {
+    jointIndex = MAX_HAND_JOINTS - 1;
+  }
+
+  const joint = handJointsUniform.$.joints[jointIndex];
+  const encodedRadius = joint.w;
+  const normal = std.normalize(hitPosition.sub(joint.xyz));
+
+  const tint = std.mix(
+    HAND_LEFT_TINT,
+    HAND_RIGHT_TINT,
+    std.step(0.0, encodedRadius),
+  );
+  const litColor = calculateLighting(hitPosition, normal, rayOrigin).mul(tint);
+  const rim = std.pow(
+    1 -
+      std.max(
+        0.0,
+        std.dot(normal, std.normalize(rayOrigin.sub(hitPosition))),
+      ),
+    2.0,
+  );
+  const glow = tint.mul(rim * 0.25);
+
+  return d.vec4f(std.saturate(litColor.add(glow)), 1.0);
+};
+
 const rayMarch = (rayOrigin: d.v3f, rayDirection: d.v3f, uv: d.v2f) => {
   'use gpu';
   let totalSteps = d.u32();
@@ -797,58 +926,62 @@ const rayMarch = (rayOrigin: d.v3f, rayDirection: d.v3f, uv: d.v2f) => {
     if (hitInfo.distance < SURF_DIST) {
       const hitPosition = rayOrigin.add(rayDirection.mul(distanceFromOrigin));
 
-      if (!(hitInfo.objectType === ObjectType.SLIDER)) {
-        break;
+      if (hitInfo.objectType === ObjectType.SLIDER) {
+        const N = getNormal(hitPosition, hitInfo);
+        const I = rayDirection;
+        const cosi = std.min(
+          1.0,
+          std.max(0.0, std.dot(std.neg(I), N)),
+        );
+        const F = fresnelSchlick(cosi, d.f32(1.0), d.f32(JELLY_IOR));
+
+        const reflection = std.saturate(d.vec3f(hitPosition.y + 0.2));
+
+        const eta = 1.0 / JELLY_IOR;
+        const k = 1.0 - eta * eta * (1.0 - cosi * cosi);
+        let refractedColor = d.vec3f();
+        if (k > 0.0) {
+          const refrDir = std.normalize(
+            std.add(
+              I.mul(eta),
+              N.mul(eta * cosi - std.sqrt(k)),
+            ),
+          );
+          const p = hitPosition.add(refrDir.mul(SURF_DIST * 2.0));
+          const exitPos = p.add(refrDir.mul(SURF_DIST * 2.0));
+
+          const env = rayMarchNoJelly(exitPos, refrDir);
+          const progress = hitInfo.t;
+          const jellyColor = jellyColorUniform.$;
+
+          const scatterTint = jellyColor.xyz.mul(1.5);
+          const density = d.f32(20.0);
+          const absorb = d.vec3f(1.0).sub(jellyColor.xyz).mul(density);
+
+          const T = beerLambert(absorb.mul(progress ** 2), 0.08);
+
+          const lightDir = std.neg(lightUniform.$.direction);
+
+          const forward = std.max(0.0, std.dot(lightDir, refrDir));
+          const scatter = scatterTint.mul(
+            JELLY_SCATTER_STRENGTH * forward * progress ** 3,
+          );
+          refractedColor = env.mul(T).add(scatter);
+        }
+
+        const jelly = std.add(
+          reflection.mul(F),
+          refractedColor.mul(1 - F),
+        );
+
+        return d.vec4f(jelly, 1.0);
       }
 
-      const N = getNormal(hitPosition, hitInfo);
-      const I = rayDirection;
-      const cosi = std.min(
-        1.0,
-        std.max(0.0, std.dot(std.neg(I), N)),
-      );
-      const F = fresnelSchlick(cosi, d.f32(1.0), d.f32(JELLY_IOR));
-
-      const reflection = std.saturate(d.vec3f(hitPosition.y + 0.2));
-
-      const eta = 1.0 / JELLY_IOR;
-      const k = 1.0 - eta * eta * (1.0 - cosi * cosi);
-      let refractedColor = d.vec3f();
-      if (k > 0.0) {
-        const refrDir = std.normalize(
-          std.add(
-            I.mul(eta),
-            N.mul(eta * cosi - std.sqrt(k)),
-          ),
-        );
-        const p = hitPosition.add(refrDir.mul(SURF_DIST * 2.0));
-        const exitPos = p.add(refrDir.mul(SURF_DIST * 2.0));
-
-        const env = rayMarchNoJelly(exitPos, refrDir);
-        const progress = hitInfo.t;
-        const jellyColor = jellyColorUniform.$;
-
-        const scatterTint = jellyColor.xyz.mul(1.5);
-        const density = d.f32(20.0);
-        const absorb = d.vec3f(1.0).sub(jellyColor.xyz).mul(density);
-
-        const T = beerLambert(absorb.mul(progress ** 2), 0.08);
-
-        const lightDir = std.neg(lightUniform.$.direction);
-
-        const forward = std.max(0.0, std.dot(lightDir, refrDir));
-        const scatter = scatterTint.mul(
-          JELLY_SCATTER_STRENGTH * forward * progress ** 3,
-        );
-        refractedColor = env.mul(T).add(scatter);
+      if (hitInfo.objectType === ObjectType.HAND) {
+        return renderHandJoint(hitPosition, hitInfo, rayOrigin);
       }
 
-      const jelly = std.add(
-        reflection.mul(F),
-        refractedColor.mul(1 - F),
-      );
-
-      return d.vec4f(jelly, 1.0);
+      break;
     }
 
     if (distanceFromOrigin > backgroundDist) {
@@ -1126,6 +1259,7 @@ async function startXrSession() {
     xrHandInteraction.dragX = null;
     xrHandInteraction.activeHand = null;
     xrHandInteraction.lastSeenTime = 0;
+    commitHandJointUniform(0);
     sliderInputX = eventHandler.currentMouseX;
     if (xrButton) {
       xrButton.disabled = false;
@@ -1144,6 +1278,7 @@ function onXrSessionEnded() {
   xrHandInteraction.dragX = null;
   xrHandInteraction.activeHand = null;
   xrHandInteraction.lastSeenTime = 0;
+  commitHandJointUniform(0);
   sliderInputX = eventHandler.currentMouseX;
   if (xrButton) {
     xrButton.disabled = false;
@@ -1230,6 +1365,7 @@ function updateXrHandInteraction(
   time: DOMHighResTimeStamp,
 ): number | null {
   if (!xrSession || !xrRefSpace || !frame.getJointPose) {
+    commitHandJointUniform(0);
     if (time - xrHandInteraction.lastSeenTime > XR_HAND_RELEASE_MS) {
       xrHandInteraction.dragX = null;
       xrHandInteraction.activeHand = null;
@@ -1237,32 +1373,64 @@ function updateXrHandInteraction(
     return xrHandInteraction.dragX;
   }
 
+  let jointWriteIndex = 0;
   let bestCandidate: XrHandCandidate | null = null;
   for (const inputSource of xrSession.inputSources) {
-    const candidate = getHandCandidate(frame, inputSource);
-    if (!candidate) {
-      continue;
-    }
+    const { nextIndex, candidate } = collectHandSourceData(
+      frame,
+      inputSource,
+      jointWriteIndex,
+    );
+    jointWriteIndex = nextIndex;
 
     if (
-      !bestCandidate ||
-      candidate.score < bestCandidate.score ||
-      (xrHandInteraction.activeHand === candidate.handedness &&
-        candidate.score <= bestCandidate.score + 1e-3)
+      candidate &&
+      (
+        !bestCandidate ||
+        candidate.score < bestCandidate.score ||
+        (xrHandInteraction.activeHand === candidate.handedness &&
+          candidate.score <= bestCandidate.score + 1e-3)
+      )
     ) {
       bestCandidate = candidate;
     }
   }
 
+  commitHandJointUniform(jointWriteIndex);
+
   if (bestCandidate) {
-    const previous = xrHandInteraction.dragX;
-    const smoothed = previous === null
-      ? bestCandidate.dragX
-      : previous + (bestCandidate.dragX - previous) * XR_HAND_SMOOTHING;
-    xrHandInteraction.dragX = smoothed;
-    xrHandInteraction.activeHand = bestCandidate.handedness;
-    xrHandInteraction.lastSeenTime = time;
-    return xrHandInteraction.dragX;
+    const sliderTipX = slider.tipX;
+    const tipDistance = bestCandidate.tipDistance;
+    const currentlyActive =
+      xrHandInteraction.activeHand === bestCandidate.handedness &&
+      xrHandInteraction.dragX !== null;
+
+    if (
+      tipDistance <= XR_HAND_CAPTURE_RADIUS ||
+      (currentlyActive && tipDistance <= XR_HAND_RELEASE_RADIUS)
+    ) {
+      const closeness = Math.max(
+        0,
+        1 - tipDistance / XR_HAND_CAPTURE_RADIUS,
+      );
+      const pullStrength = XR_HAND_APPROACH_MIN +
+        closeness * (XR_HAND_APPROACH_MAX - XR_HAND_APPROACH_MIN);
+      const desired = sliderTipX +
+        (bestCandidate.dragX - sliderTipX) * pullStrength;
+      const previous = xrHandInteraction.dragX ?? sliderTipX;
+      const smoothed = previous +
+        (desired - previous) * XR_HAND_SMOOTHING;
+
+      xrHandInteraction.dragX = smoothed;
+      xrHandInteraction.activeHand = bestCandidate.handedness;
+      xrHandInteraction.lastSeenTime = time;
+      return xrHandInteraction.dragX;
+    }
+
+    if (tipDistance > XR_HAND_RELEASE_RADIUS && currentlyActive) {
+      xrHandInteraction.activeHand = null;
+      xrHandInteraction.dragX = null;
+    }
   }
 
   if (time - xrHandInteraction.lastSeenTime > XR_HAND_RELEASE_MS) {
@@ -1273,30 +1441,89 @@ function updateXrHandInteraction(
   return xrHandInteraction.dragX;
 }
 
-function getHandCandidate(
+type Vec3Tuple = [number, number, number];
+
+function collectHandSourceData(
   frame: XRFrame,
   inputSource: XRInputSource,
-): XrHandCandidate | null {
+  writeIndex: number,
+): { nextIndex: number; candidate: XrHandCandidate | null } {
   if (
     !xrRefSpace ||
     !inputSource.hand ||
     inputSource.handedness === 'none' ||
     !frame.getJointPose
   ) {
-    return null;
+    return { nextIndex: writeIndex, candidate: null };
   }
 
-  const jointSpace = inputSource.hand.get(XR_INTERACTION_JOINT);
-  if (!jointSpace) {
-    return null;
+  let candidate: XrHandCandidate | null = null;
+  const handedness = inputSource.handedness;
+
+  for (const jointName of XR_HAND_JOINTS) {
+    if (writeIndex >= MAX_HAND_JOINTS) {
+      break;
+    }
+    const jointSpace = inputSource.hand.get(jointName);
+    if (!jointSpace) {
+      continue;
+    }
+    const jointPose = frame.getJointPose(jointSpace, xrRefSpace);
+    if (!jointPose) {
+      continue;
+    }
+    const point = transformPoint(
+      xrSceneTransformInv,
+      jointPose.transform.position,
+    );
+    const radius = jointPose.radius ?? 0.008;
+    writeHandJointData(writeIndex, point, radius, handedness);
+    if (jointName === XR_INTERACTION_JOINT) {
+      const maybeCandidate = createHandCandidateFromPoint(point, handedness);
+      if (maybeCandidate) {
+        candidate = maybeCandidate;
+      }
+    }
+    writeIndex++;
   }
 
-  const jointPose = frame.getJointPose(jointSpace, xrRefSpace);
-  if (!jointPose) {
-    return null;
-  }
+  return { nextIndex: writeIndex, candidate };
+}
 
-  const point = transformPoint(xrSceneTransformInv, jointPose.transform.position);
+function writeHandJointData(
+  index: number,
+  point: Vec3Tuple,
+  radius: number,
+  handedness: XRHandedness,
+) {
+  if (index >= MAX_HAND_JOINTS) {
+    return;
+  }
+  const target = handJointData[index];
+  target[0] = point[0];
+  target[1] = point[1];
+  target[2] = point[2];
+  const visualRadius = Math.max(radius, 0.006) *
+    XR_SCENE_SCALE *
+    XR_HAND_VISUAL_SCALE;
+  target[3] = visualRadius * (handedness === 'right' ? 1 : -1);
+}
+
+function commitHandJointUniform(count: number) {
+  for (let i = count; i < MAX_HAND_JOINTS; i++) {
+    handJointData[i][3] = 0;
+  }
+  handJointsUniform.write({
+    joints: handJointData,
+    count: d.u32(count),
+    padding: handJointPadding,
+  });
+}
+
+function createHandCandidateFromPoint(
+  point: Vec3Tuple,
+  handedness: XRHandedness,
+): XrHandCandidate | null {
   if (!pointWithinSliderBounds(point)) {
     return null;
   }
@@ -1307,16 +1534,17 @@ function getHandCandidate(
   const normalizedY = Math.abs(point[1] - sliderMidY) /
     (verticalRange * 0.5 + XR_HAND_Y_MARGIN);
   const normalizedZ = Math.abs(point[2]) / XR_HAND_Z_THRESHOLD;
-  const score = normalizedZ + normalizedY * 0.5;
+  const sliderTipX = slider.tipX;
+  const tipDistance = Math.abs(point[0] - sliderTipX);
+  const score = tipDistance + normalizedY * 0.35 + normalizedZ * 0.5;
 
   return {
     dragX: point[0],
     score,
-    handedness: inputSource.handedness,
+    handedness,
+    tipDistance,
   };
 }
-
-type Vec3Tuple = [number, number, number];
 
 function pointWithinSliderBounds([x, y, z]: Vec3Tuple) {
   const [top, right, bottom, left] = bezierBbox;

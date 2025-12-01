@@ -451,4 +451,8 @@ export class Slider {
       d.vec4f(secondLast.x, secondLast.y, last.x, last.y),
     );
   }
+
+  get tipX() {
+    return this.#targetX;
+  }
 }

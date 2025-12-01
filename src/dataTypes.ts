@@ -9,6 +9,7 @@ export const DirectionalLight = d.struct({
 export const ObjectType = {
   SLIDER: 1,
   BACKGROUND: 2,
+  HAND: 3,
 } as const;
 
 export const HitInfo = d.struct({
