@@ -7,6 +7,7 @@ import { fullScreenTriangle } from 'typegpu/common';
 import { randf } from '@typegpu/noise';
 import { Slider } from './slider.ts';
 import { CameraController } from './camera.ts';
+import * as m from 'wgpu-matrix';
 import { EventHandler } from './events.ts';
 import {
   DirectionalLight,
@@ -49,8 +50,12 @@ import { NumberProvider } from './numbers.ts';
 const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
 const canvas = document.querySelector('canvas') as HTMLCanvasElement;
 const context = canvas.getContext('webgpu') as GPUCanvasContext;
+const xrButton = document.getElementById('xr-button') as HTMLButtonElement | null;
 
 const root = await tgpu.init({
+  adapter: {
+    xrCompatible: true,
+  },
   device: {
     optionalFeatures: ['timestamp-query'],
   },
@@ -94,11 +99,14 @@ const filteringSampler = root['~unstable'].createSampler({
   minFilter: 'linear',
 });
 
+const baseCameraPosition = d.vec3f(0.024, 2.7, 1.9);
+const baseCameraTarget = d.vec3f(0, 0, 0);
+const baseCameraUp = d.vec3f(0, 1, 0);
 const camera = new CameraController(
   root,
-  d.vec3f(0.024, 2.7, 1.9),
-  d.vec3f(0, 0, 0),
-  d.vec3f(0, 1, 0),
+  baseCameraPosition,
+  baseCameraTarget,
+  baseCameraUp,
   Math.PI / 4,
   width,
   height,
@@ -842,10 +850,27 @@ const fragmentMain = tgpu['~unstable'].fragmentFn({
   );
 });
 
-const rayMarchPipeline = root['~unstable']
-  .withVertex(fullScreenTriangle, {})
-  .withFragment(raymarchFn, { format: 'rgba8unorm' })
-  .createPipeline();
+const RAY_MARCH_FORMAT: GPUTextureFormat = 'rgba8unorm';
+const rayMarchPipelines = new Map<
+  GPUTextureFormat,
+  ReturnType<typeof createRayMarchPipeline>
+>();
+
+function createRayMarchPipeline(format: GPUTextureFormat) {
+  return root['~unstable']
+    .withVertex(fullScreenTriangle, {})
+    .withFragment(raymarchFn, { format })
+    .createPipeline();
+}
+
+function getRayMarchPipeline(format: GPUTextureFormat) {
+  let pipeline = rayMarchPipelines.get(format);
+  if (!pipeline) {
+    pipeline = createRayMarchPipeline(format);
+    rayMarchPipelines.set(format, pipeline);
+  }
+  return pipeline;
+}
 
 const renderPipeline = root['~unstable']
   .withVertex(fullScreenTriangle, {})
@@ -856,6 +881,12 @@ const eventHandler = new EventHandler(canvas);
 let lastTimeStamp = performance.now();
 let frameCount = 0;
 const taaResolver = new TAAResolver(root, width, height);
+let xrSession: XRSession | null = null;
+let xrRefSpace: XRReferenceSpace | null = null;
+let xrGpuBinding: XRGPUBinding | null = null;
+let xrProjectionLayer: XRProjectionLayer | null = null;
+let xrColorFormat: GPUTextureFormat | null = null;
+let isPresentingXr = false;
 
 let attributionDismissed = false;
 const attributionElement = document.getElementById(
@@ -889,12 +920,16 @@ function createBindGroups() {
 
 let bindGroups = createBindGroups();
 
-function render(timestamp: number) {
-  frameCount++;
-  camera.jitter();
-  const deltaTime = Math.min((timestamp - lastTimeStamp) * 0.001, 0.1);
+function getDeltaSeconds(timestamp: number) {
+  if (!Number.isFinite(timestamp)) {
+    return 0;
+  }
+  const delta = Math.min((timestamp - lastTimeStamp) * 0.001, 0.1);
   lastTimeStamp = timestamp;
+  return delta;
+}
 
+function updateSimulation(deltaTime: number) {
   randomUniform.write(
     d.vec2f((Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2),
   );
@@ -902,15 +937,27 @@ function render(timestamp: number) {
   eventHandler.update();
   slider.setDragX(eventHandler.currentMouseX);
   slider.update(deltaTime);
+}
+
+function render(timestamp: number) {
+  if (isPresentingXr) {
+    return;
+  }
+
+  frameCount++;
+  camera.jitter();
+  const deltaTime = getDeltaSeconds(timestamp);
+  updateSimulation(deltaTime);
 
   const currentFrame = frameCount % 2;
 
-  rayMarchPipeline
+  getRayMarchPipeline(RAY_MARCH_FORMAT)
     .withColorAttachment({
       view: root.unwrap(textures[currentFrame].sampled),
       loadOp: 'clear',
       storeOp: 'store',
     })
+    .with(bindGroups.rayMarch)
     .draw(3);
 
   taaResolver.resolve(
@@ -928,7 +975,9 @@ function render(timestamp: number) {
     .with(bindGroups.render[currentFrame])
     .draw(3);
 
-  requestAnimationFrame(render);
+  if (!isPresentingXr) {
+    requestAnimationFrame(render);
+  }
 }
 
 function handleResize() {
@@ -945,11 +994,191 @@ function handleResize() {
   bindGroups = createBindGroups();
 }
 
+async function setupXrButton() {
+  if (!xrButton) {
+    return;
+  }
+
+  if (!navigator.xr) {
+    xrButton.textContent = 'WebXR unavailable';
+    return;
+  }
+
+  if (!navigator.gpu) {
+    xrButton.textContent = 'WebGPU unavailable';
+    return;
+  }
+
+  if (!('XRGPUBinding' in window)) {
+    xrButton.textContent = 'XR/WebGPU unsupported';
+    return;
+  }
+
+  const supported = await navigator.xr.isSessionSupported('immersive-vr');
+  if (!supported) {
+    xrButton.textContent = 'VR not supported';
+    return;
+  }
+
+  xrButton.disabled = false;
+  xrButton.textContent = 'Enter VR';
+  xrButton.addEventListener('click', () => {
+    if (xrSession) {
+      xrSession.end();
+    } else {
+      void startXrSession();
+    }
+  });
+}
+
+async function startXrSession() {
+  if (!navigator.xr) {
+    return;
+  }
+
+  if (xrButton) {
+    xrButton.disabled = true;
+    xrButton.textContent = 'Starting…';
+  }
+
+  try {
+    const session = await navigator.xr.requestSession('immersive-vr', {
+      requiredFeatures: ['webgpu'],
+    });
+    xrSession = session;
+    isPresentingXr = true;
+
+    session.addEventListener('end', onXrSessionEnded);
+
+    xrGpuBinding = new XRGPUBinding(session, root.device);
+    const preferredColorFormat =
+      xrGpuBinding.getPreferredColorFormat() ?? presentationFormat;
+    xrColorFormat = preferredColorFormat;
+    const projectionLayer = xrGpuBinding.createProjectionLayer({
+      colorFormat: preferredColorFormat,
+    });
+    xrProjectionLayer = projectionLayer;
+    session.updateRenderState({ layers: [projectionLayer] });
+
+    xrRefSpace = await session.requestReferenceSpace('local');
+
+    if (xrButton) {
+      xrButton.disabled = false;
+      xrButton.textContent = 'Exit VR';
+    }
+
+    session.requestAnimationFrame(onXrFrame);
+  } catch (error) {
+    console.error('Failed to start XR session', error);
+    xrSession = null;
+    xrRefSpace = null;
+    xrGpuBinding = null;
+    xrProjectionLayer = null;
+    isPresentingXr = false;
+    if (xrButton) {
+      xrButton.disabled = false;
+      xrButton.textContent = 'Enter VR';
+    }
+    requestAnimationFrame(render);
+  }
+}
+
+function onXrSessionEnded() {
+  xrSession = null;
+  xrRefSpace = null;
+  xrGpuBinding = null;
+  xrProjectionLayer = null;
+  isPresentingXr = false;
+  if (xrButton) {
+    xrButton.disabled = false;
+    xrButton.textContent = 'Enter VR';
+  }
+
+  camera.updateView(baseCameraPosition, baseCameraTarget, baseCameraUp);
+  camera.updateProjection(Math.PI / 4, width, height);
+  lastTimeStamp = performance.now();
+  requestAnimationFrame(render);
+}
+
+function onXrFrame(time: DOMHighResTimeStamp, frame: XRFrame) {
+  if (!xrSession || !xrRefSpace || !xrGpuBinding || !xrProjectionLayer) {
+    return;
+  }
+
+  xrSession.requestAnimationFrame(onXrFrame);
+
+  const pose = frame.getViewerPose(xrRefSpace);
+  if (!pose) {
+    return;
+  }
+
+  const deltaTime = getDeltaSeconds(time);
+  updateSimulation(deltaTime);
+
+  const xrFormat = xrColorFormat ?? RAY_MARCH_FORMAT;
+  const xrPipeline = getRayMarchPipeline(xrFormat);
+
+  for (const view of pose.views) {
+    updateCameraFromXrView(view);
+    const subImage = xrGpuBinding.getViewSubImage(xrProjectionLayer, view);
+    const colorView = subImage.colorTexture.createView(
+      subImage.getViewDescriptor(),
+    );
+
+    xrPipeline
+      .withColorAttachment({
+        view: colorView,
+        loadOp: 'clear',
+        storeOp: 'store',
+      })
+      .with(bindGroups.rayMarch)
+      .draw(3);
+  }
+}
+
+function updateCameraFromXrView(view: XRView) {
+  const viewMatrix = mat4FromArrayLike(view.transform.inverse.matrix);
+  const viewInvMatrix = mat4FromArrayLike(view.transform.matrix);
+  const projMatrix = mat4FromArrayLike(view.projectionMatrix);
+  const invertedProj = m.mat4.invert(
+    view.projectionMatrix,
+    m.mat4.identity(),
+  );
+  const projInvMatrix = invertedProj
+    ? mat4FromArrayLike(invertedProj)
+    : identityMat4();
+
+  cameraUniform.write({
+    view: viewMatrix,
+    viewInv: viewInvMatrix,
+    proj: projMatrix,
+    projInv: projInvMatrix,
+  });
+}
+
+function mat4FromArrayLike(source: ArrayLike<number>) {
+  const mat = d.mat4x4f();
+  for (let i = 0; i < 16; i++) {
+    mat[i] = source[i] ?? 0;
+  }
+  return mat;
+}
+
+function identityMat4() {
+  const mat = d.mat4x4f();
+  mat[0] = 1;
+  mat[5] = 1;
+  mat[10] = 1;
+  mat[15] = 1;
+  return mat;
+}
+
 const resizeObserver = new ResizeObserver(() => {
   handleResize();
 });
 resizeObserver.observe(canvas);
 
+void setupXrButton();
 requestAnimationFrame(render);
 
 // #region Example controls and cleanup
@@ -964,7 +1193,7 @@ async function autoSetQuaility() {
   let resolutionScale = 0.3;
   let lastTimeMs = 0;
 
-  const measurePipeline = rayMarchPipeline
+  const measurePipeline = getRayMarchPipeline(RAY_MARCH_FORMAT)
     .withPerformanceCallback((start, end) => {
       lastTimeMs = Number(end - start) / 1e6;
     });

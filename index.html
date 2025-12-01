@@ -7,6 +7,24 @@
 </head>
 <body>
 <style>
+  #xr-button {
+    position: absolute;
+    top: 1rem;
+    right: 1rem;
+    padding: 0.5rem 1rem;
+    border-radius: 0.5rem;
+    border: none;
+    background: rgba(0, 0, 0, 0.75);
+    color: white;
+    cursor: pointer;
+    z-index: 3;
+  }
+
+  #xr-button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
   #attribution {
     opacity: 1;
     position: absolute;
@@ -42,6 +60,7 @@
   <a href="https://x.com/cerpow/status/1964953851603358112" target="_blank"
   >Voicu Apostol</a>
 </div>
+<button id="xr-button" disabled>Checking VR support…</button>
 <canvas></canvas>
 
 <script type="module" src="/index.ts"></script>
