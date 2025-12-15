@@ -52,6 +52,19 @@ const canvas = document.querySelector('canvas') as HTMLCanvasElement;
 const context = canvas.getContext('webgpu') as GPUCanvasContext;
 const xrVrButton = document.getElementById('xr-button') as HTMLButtonElement | null;
 const xrArButton = document.getElementById('xr-ar-button') as HTMLButtonElement | null;
+type XrCompatibleGl = WebGL2RenderingContext & {
+  makeXRCompatible?: () => Promise<void>;
+};
+const xrWebGpuSupported = 'XRGPUBinding' in window;
+const XR_FALLBACK_LABEL_SUFFIX = ' (copy)';
+const XR_FALLBACK_RESOLUTION_PRESETS = [
+  { label: 'Performance', scale: 0.55 },
+  { label: 'Balanced', scale: 0.75 },
+  { label: 'Quality', scale: 1.0 },
+] as const;
+const XR_COPY_BASE_RESOLUTION = 2048;
+const XR_COPY_MIN_RESOLUTION = 960;
+let fallbackResolutionIndex = 1;
 
 const root = await tgpu.init({
   adapter: {
@@ -92,6 +105,8 @@ const digitsTextureView = digitsProvider.digitTextureAtlas.createView(
 );
 
 let qualityScale = 0.5;
+let fallbackQualityScale = XR_FALLBACK_RESOLUTION_PRESETS[fallbackResolutionIndex].scale;
+let fallbackWarningElement: HTMLDivElement | null = null;
 let [width, height] = [
   canvas.width * qualityScale,
   canvas.height * qualityScale,
@@ -120,7 +135,7 @@ const camera = new CameraController(
 const cameraUniform = camera.cameraUniform;
 
 const XR_SCENE_SCALE = 0.2;
-const XR_SCENE_TRANSLATION = [0, -0.5, -1.1] as const;
+const XR_SCENE_TRANSLATION = [0, -0.45, -0.45] as const;
 const xrScaleMatrix = m.mat4.scaling(
   [XR_SCENE_SCALE, XR_SCENE_SCALE, XR_SCENE_SCALE],
   m.mat4.identity(),
@@ -581,7 +596,7 @@ const getFakeShadow = (
 
   if (position.y < -GroundParams.groundThickness) {
     // Applying darkening under the ground (the shadow cast by the upper ground layer)
-    const fadeSharpness = 30;
+    const fadeSharpness = 30.0;
     const inset = 0.02;
     const cutout = rectangleCutoutDist(position.xz) + inset;
     const edgeDarkening = std.saturate(1 - cutout * fadeSharpness);
@@ -618,7 +633,7 @@ const getFakeShadow = (
 
     const contrast = 20 * std.saturate(finalUV.y) * (0.8 + endCapX * 0.2);
     const shadowOffset = -0.3;
-    const featherSharpness = 10;
+    const featherSharpness = 10.0;
     const uvEdgeFeather = std.saturate(finalUV.x * featherSharpness) *
       std.saturate((1 - finalUV.x) * featherSharpness) *
       std.saturate((1 - finalUV.y) * featherSharpness) *
@@ -1158,10 +1173,24 @@ let xrRefSpace: XRReferenceSpace | null = null;
 let xrGpuBinding: XRGPUBinding | null = null;
 let xrProjectionLayer: XRProjectionLayer | null = null;
 let xrColorFormat: GPUTextureFormat | null = null;
+let xrGlContext: XrCompatibleGl | null = null;
+let xrGlLayer: XRWebGLLayer | null = null;
+let xrGlProgram: WebGLProgram | null = null;
+let xrGlTexture: WebGLTexture | null = null;
+let xrGlVao: WebGLVertexArrayObject | null = null;
+let xrGlSamplerLocation: WebGLUniformLocation | null = null;
 let isPresentingXr = false;
 let activeXrMode: XRSessionMode | null = null;
 let xrVrSupported = false;
 let xrArSupported = false;
+
+function isXrFallbackActive() {
+  return Boolean(xrSession && !xrGpuBinding && xrGlLayer);
+}
+
+function getActiveQualityScale() {
+  return qualityScale;
+}
 
 let attributionDismissed = false;
 const attributionElement = document.getElementById(
@@ -1194,6 +1223,7 @@ function createBindGroups() {
 }
 
 let bindGroups = createBindGroups();
+handleResize();
 
 function getDeltaSeconds(timestamp: number) {
   if (!Number.isFinite(timestamp)) {
@@ -1263,9 +1293,18 @@ function render(timestamp: number) {
 }
 
 function handleResize() {
+  const [targetCanvasWidth, targetCanvasHeight] = computeCanvasPixelSize();
+  const canvasSizeChanged =
+    targetCanvasWidth !== canvas.width || targetCanvasHeight !== canvas.height;
+  if (canvasSizeChanged) {
+    canvas.width = targetCanvasWidth;
+    canvas.height = targetCanvasHeight;
+  }
+
+  const activeScale = getActiveQualityScale();
   [width, height] = [
-    canvas.width * qualityScale,
-    canvas.height * qualityScale,
+    canvas.width * activeScale,
+    canvas.height * activeScale,
   ];
   camera.updateProjection(Math.PI / 4, width, height);
   textures = createTextures(root, width, height);
@@ -1274,6 +1313,11 @@ function handleResize() {
   frameCount = 0;
 
   bindGroups = createBindGroups();
+  if (xrGlContext) {
+    const glCanvas = xrGlContext.canvas as HTMLCanvasElement;
+    glCanvas.width = canvas.width;
+    glCanvas.height = canvas.height;
+  }
 }
 
 async function setupXrButtons() {
@@ -1289,10 +1333,9 @@ async function setupXrButtons() {
     return;
   }
 
-  if (!('XRGPUBinding' in window)) {
-    setXrButtonState(xrVrButton, 'XR/WebGPU unsupported', true);
-    setXrButtonState(xrArButton, 'XR/WebGPU unsupported', true);
-    return;
+  if (!xrWebGpuSupported) {
+    console.warn('XR/WebGPU unsupported; enabling WebGL blit fallback.');
+    showFallbackWarning();
   }
 
   const [vrSupported, arSupported] = await Promise.all([
@@ -1316,6 +1359,89 @@ function setXrButtonState(
   button.disabled = disabled;
 }
 
+function getXrEnterLabel(label: string) {
+  if (xrWebGpuSupported) {
+    return `Enter ${label}`;
+  }
+  return `Enter ${label}${XR_FALLBACK_LABEL_SUFFIX}`;
+}
+
+function getXrStartingLabel(label: string) {
+  if (xrWebGpuSupported) {
+    return `Starting ${label}…`;
+  }
+  return `Starting ${label}${XR_FALLBACK_LABEL_SUFFIX}…`;
+}
+
+function showFallbackWarning() {
+  if (xrWebGpuSupported || fallbackWarningElement) {
+    return;
+  }
+  const warning = document.createElement('div');
+  warning.textContent =
+    'XR WebGPU unavailable — running slower copy-mode fallback (expect extra latency).';
+  warning.style.marginTop = '0.5rem';
+  warning.style.padding = '0.5rem 0.75rem';
+  warning.style.borderRadius = '0.5rem';
+  warning.style.background = 'rgba(255, 149, 0, 0.15)';
+  warning.style.color = '#ffb347';
+  warning.style.fontSize = '0.85rem';
+  warning.style.fontWeight = '600';
+  warning.style.textAlign = 'center';
+  warning.style.maxWidth = '320px';
+  warning.style.lineHeight = '1.3';
+  warning.style.backdropFilter = 'blur(4px)';
+  warning.style.border = '1px solid rgba(255, 149, 0, 0.35)';
+  const controls = document.getElementById('xr-controls');
+  if (controls) {
+    controls.insertAdjacentElement('afterend', warning);
+  } else {
+    document.body.appendChild(warning);
+  }
+  fallbackWarningElement = warning;
+}
+
+function getCanvasClientSize() {
+  const rect = canvas.getBoundingClientRect();
+  const width = rect.width || canvas.clientWidth || canvas.width || 1;
+  const height = rect.height || canvas.clientHeight || canvas.height || 1;
+  return { width, height };
+}
+
+function computeCanvasPixelSize() {
+  const dpr = window.devicePixelRatio || 1;
+  const { width: cssWidth, height: cssHeight } = getCanvasClientSize();
+  if (!isXrFallbackActive()) {
+    return [
+      Math.max(2, Math.round(cssWidth * dpr)),
+      Math.max(2, Math.round(cssHeight * dpr)),
+    ];
+  }
+
+  const aspectRatio = cssHeight > 0 && cssWidth > 0
+    ? cssHeight / Math.max(cssWidth, 1)
+    : 1;
+  const baseTarget = Math.max(
+    XR_COPY_MIN_RESOLUTION,
+    Math.round(XR_COPY_BASE_RESOLUTION * fallbackQualityScale),
+  );
+  const previewTarget = Math.max(
+    Math.round(cssWidth * dpr),
+    Math.round(cssHeight * dpr),
+    XR_COPY_MIN_RESOLUTION,
+  );
+  const targetWidth = Math.max(previewTarget, baseTarget);
+  const targetHeight = Math.max(
+    XR_COPY_MIN_RESOLUTION,
+    Math.round(targetWidth * aspectRatio),
+  );
+  const maxTexture = root.device.limits.maxTextureDimension2D ?? targetWidth;
+  return [
+    Math.min(maxTexture, targetWidth),
+    Math.min(maxTexture, targetHeight),
+  ];
+}
+
 function configureXrButton(
   button: HTMLButtonElement | null,
   supported: boolean,
@@ -1327,7 +1453,7 @@ function configureXrButton(
     setXrButtonState(button, `${label} not supported`, true);
     return;
   }
-  setXrButtonState(button, `Enter ${label}`, false);
+  setXrButtonState(button, getXrEnterLabel(label), false);
   button.onclick = () => {
     if (xrSession && activeXrMode === mode) {
       xrSession.end();
@@ -1335,6 +1461,236 @@ function configureXrButton(
       void startXrSession(mode);
     }
   };
+}
+
+function ensureXrGlContext(): XrCompatibleGl | null {
+  if (xrGlContext) {
+    return xrGlContext;
+  }
+
+  const fallbackCanvas = document.createElement('canvas');
+  fallbackCanvas.width = canvas.width;
+  fallbackCanvas.height = canvas.height;
+  const gl = fallbackCanvas.getContext('webgl2', {
+    alpha: false,
+    antialias: false,
+    preserveDrawingBuffer: false,
+  }) as XrCompatibleGl | null;
+
+  if (!gl) {
+    console.warn('Unable to create WebGL2 context for XR fallback');
+    return null;
+  }
+
+  const program = createXrGlProgram(gl);
+  if (!program) {
+    return null;
+  }
+
+  const vao = createXrGlQuad(gl, program);
+  const samplerLocation = gl.getUniformLocation(program, 'uTexture');
+  const texture = gl.createTexture();
+
+  if (!vao || !samplerLocation || !texture) {
+    console.warn('Failed to initialize XR fallback GL resources');
+    return null;
+  }
+
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.bindTexture(gl.TEXTURE_2D, null);
+  gl.disable(gl.DEPTH_TEST);
+  gl.disable(gl.CULL_FACE);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 1);
+
+  xrGlProgram = program;
+  xrGlVao = vao;
+  xrGlSamplerLocation = samplerLocation;
+  xrGlTexture = texture;
+  xrGlContext = gl;
+  return xrGlContext;
+}
+
+function createXrGlProgram(gl: WebGL2RenderingContext) {
+  const vertexSource = `#version 300 es
+    in vec2 position;
+    in vec2 uv;
+    out vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = vec4(position, 0.0, 1.0);
+    }
+  `;
+  const fragmentSource = `#version 300 es
+    precision mediump float;
+    in vec2 vUv;
+    uniform sampler2D uTexture;
+    out vec4 fragColor;
+    void main() {
+      fragColor = texture(uTexture, vUv);
+    }
+  `;
+
+  const vertexShader = gl.createShader(gl.VERTEX_SHADER);
+  const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
+  if (!vertexShader || !fragmentShader) {
+    console.warn('Failed to create XR fallback shaders');
+    return null;
+  }
+
+  gl.shaderSource(vertexShader, vertexSource);
+  gl.shaderSource(fragmentShader, fragmentSource);
+  gl.compileShader(vertexShader);
+  gl.compileShader(fragmentShader);
+
+  if (!gl.getShaderParameter(vertexShader, gl.COMPILE_STATUS)) {
+    console.error('XR fallback vertex shader error', gl.getShaderInfoLog(vertexShader));
+    gl.deleteShader(vertexShader);
+    gl.deleteShader(fragmentShader);
+    return null;
+  }
+
+  if (!gl.getShaderParameter(fragmentShader, gl.COMPILE_STATUS)) {
+    console.error('XR fallback fragment shader error', gl.getShaderInfoLog(fragmentShader));
+    gl.deleteShader(vertexShader);
+    gl.deleteShader(fragmentShader);
+    return null;
+  }
+
+  const program = gl.createProgram();
+  if (!program) {
+    console.warn('Failed to create XR fallback GL program');
+    gl.deleteShader(vertexShader);
+    gl.deleteShader(fragmentShader);
+    return null;
+  }
+
+  gl.attachShader(program, vertexShader);
+  gl.attachShader(program, fragmentShader);
+  gl.linkProgram(program);
+  gl.deleteShader(vertexShader);
+  gl.deleteShader(fragmentShader);
+
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error('XR fallback program link error', gl.getProgramInfoLog(program));
+    gl.deleteProgram(program);
+    return null;
+  }
+
+  return program;
+}
+
+function createXrGlQuad(gl: WebGL2RenderingContext, program: WebGLProgram) {
+  const vao = gl.createVertexArray();
+  if (!vao) {
+    return null;
+  }
+
+  gl.bindVertexArray(vao);
+
+  const quadVertices = new Float32Array([
+    -1, -1,
+    1, -1,
+    -1, 1,
+    1, 1,
+  ]);
+  const quadBuffer = gl.createBuffer();
+  if (!quadBuffer) {
+    gl.bindVertexArray(null);
+    return null;
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, quadVertices, gl.STATIC_DRAW);
+  const positionLocation = gl.getAttribLocation(program, 'position');
+  gl.enableVertexAttribArray(positionLocation);
+  gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+
+  const uvVertices = new Float32Array([
+    0, 0,
+    1, 0,
+    0, 1,
+    1, 1,
+  ]);
+  const uvBuffer = gl.createBuffer();
+  if (!uvBuffer) {
+    gl.bindVertexArray(null);
+    return null;
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, uvBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, uvVertices, gl.STATIC_DRAW);
+  const uvLocation = gl.getAttribLocation(program, 'uv');
+  gl.enableVertexAttribArray(uvLocation);
+  gl.vertexAttribPointer(uvLocation, 2, gl.FLOAT, false, 0, 0);
+
+  gl.bindVertexArray(null);
+  gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  return vao;
+}
+
+async function setupXrGlLayer(session: XRSession) {
+  const gl = ensureXrGlContext();
+  if (!gl) {
+    throw new Error('WebGL context unavailable for XR fallback');
+  }
+  if (gl.makeXRCompatible) {
+    await gl.makeXRCompatible();
+  }
+  const layer = new XRWebGLLayer(session, gl, { alpha: false });
+  xrGlLayer = layer;
+  session.updateRenderState({ baseLayer: layer });
+}
+
+function copyCanvasToXrGlTexture(gl: WebGL2RenderingContext) {
+  if (!xrGlTexture) {
+    return;
+  }
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, xrGlTexture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+}
+
+function drawXrGlQuad(gl: WebGL2RenderingContext) {
+  if (!xrGlProgram || !xrGlVao || !xrGlSamplerLocation || !xrGlTexture) {
+    return;
+  }
+  gl.useProgram(xrGlProgram);
+  gl.bindVertexArray(xrGlVao);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, xrGlTexture);
+  gl.uniform1i(xrGlSamplerLocation, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.bindVertexArray(null);
+}
+
+function applyFallbackResolution(index: number, force = false) {
+  const presetCount = XR_FALLBACK_RESOLUTION_PRESETS.length;
+  if (!presetCount) {
+    return;
+  }
+  const clamped = Math.max(0, Math.min(presetCount - 1, index));
+  fallbackResolutionIndex = clamped;
+  const preset = XR_FALLBACK_RESOLUTION_PRESETS[clamped];
+  if (!preset) {
+    return;
+  }
+  const needsApply = Math.abs(preset.scale - fallbackQualityScale) > 1e-3;
+  fallbackQualityScale = preset.scale;
+  if (force || (needsApply && isXrFallbackActive())) {
+    handleResize();
+  }
+}
+
+const fallbackQualityOptions = XR_FALLBACK_RESOLUTION_PRESETS.map(
+  (preset) => preset.label,
+);
+
+function getFallbackQualityLabel() {
+  return fallbackQualityOptions[fallbackResolutionIndex] ||
+    fallbackQualityOptions[0] ||
+    'Balanced';
 }
 
 async function startXrSession(mode: XRSessionMode) {
@@ -1348,7 +1704,7 @@ async function startXrSession(mode: XRSessionMode) {
   if (targetButton) {
     setXrButtonState(
       targetButton,
-      mode === 'immersive-vr' ? 'Starting VR…' : 'Starting AR…',
+      getXrStartingLabel(mode === 'immersive-vr' ? 'VR' : 'AR'),
       true,
     );
   }
@@ -1357,10 +1713,17 @@ async function startXrSession(mode: XRSessionMode) {
   }
 
   try {
-    const session = await navigator.xr.requestSession(mode, {
-      requiredFeatures: ['webgpu'],
-      optionalFeatures: ['hand-tracking'],
-    });
+    const optionalFeatures: XRSessionFeature[] = ['hand-tracking'];
+    if (!xrWebGpuSupported) {
+      optionalFeatures.push('local-floor');
+    }
+    const sessionInit: XRSessionInit = { optionalFeatures };
+    if (xrWebGpuSupported) {
+      sessionInit.requiredFeatures = ['webgpu'];
+    } else {
+      sessionInit.optionalFeatures?.push('local-floor');
+    }
+    const session = await navigator.xr.requestSession(mode, sessionInit);
     xrSession = session;
     isPresentingXr = true;
     activeXrMode = mode;
@@ -1368,15 +1731,24 @@ async function startXrSession(mode: XRSessionMode) {
 
     session.addEventListener('end', onXrSessionEnded);
 
-    xrGpuBinding = new XRGPUBinding(session, root.device);
-    const preferredColorFormat =
-      xrGpuBinding.getPreferredColorFormat() ?? presentationFormat;
-    xrColorFormat = preferredColorFormat;
-    const projectionLayer = xrGpuBinding.createProjectionLayer({
-      colorFormat: preferredColorFormat,
-    });
-    xrProjectionLayer = projectionLayer;
-    session.updateRenderState({ layers: [projectionLayer] });
+    if (xrWebGpuSupported) {
+      xrGpuBinding = new XRGPUBinding(session, root.device);
+      const preferredColorFormat =
+        xrGpuBinding.getPreferredColorFormat() ?? presentationFormat;
+      xrColorFormat = preferredColorFormat;
+      const projectionLayer = xrGpuBinding.createProjectionLayer({
+        colorFormat: preferredColorFormat,
+      });
+      xrProjectionLayer = projectionLayer;
+      xrGlLayer = null;
+      session.updateRenderState({ layers: [projectionLayer] });
+    } else {
+      xrGpuBinding = null;
+      xrProjectionLayer = null;
+      xrColorFormat = presentationFormat;
+      await setupXrGlLayer(session);
+      applyFallbackResolution(fallbackResolutionIndex, true);
+    }
 
     xrRefSpace = await session.requestReferenceSpace('local');
 
@@ -1398,6 +1770,7 @@ async function startXrSession(mode: XRSessionMode) {
     xrRefSpace = null;
     xrGpuBinding = null;
     xrProjectionLayer = null;
+    xrGlLayer = null;
     isPresentingXr = false;
     activeXrMode = null;
     interactionOnlyUniform.write(d.u32(0));
@@ -1407,26 +1780,61 @@ async function startXrSession(mode: XRSessionMode) {
     xrHandInteraction.isPinching = false;
     commitHandJointUniform(0);
     sliderInputX = eventHandler.currentMouseX;
+    handleResize();
     if (targetButton) {
       const supported = mode === 'immersive-vr' ? xrVrSupported : xrArSupported;
       const label = mode === 'immersive-vr' ? 'VR' : 'AR';
-      setXrButtonState(
-        targetButton,
-        supported ? `Enter ${label}` : `${label} not supported`,
-        !supported,
-      );
+      if (supported) {
+        setXrButtonState(targetButton, getXrEnterLabel(label), false);
+      } else {
+        setXrButtonState(targetButton, `${label} not supported`, true);
+      }
     }
     if (otherButton) {
       const supported = mode === 'immersive-vr' ? xrArSupported : xrVrSupported;
       const label = mode === 'immersive-vr' ? 'AR' : 'VR';
-      setXrButtonState(
-        otherButton,
-        supported ? `Enter ${label}` : `${label} not supported`,
-        !supported,
-      );
+      if (supported) {
+        setXrButtonState(otherButton, getXrEnterLabel(label), false);
+      } else {
+        setXrButtonState(otherButton, `${label} not supported`, true);
+      }
     }
     requestAnimationFrame(render);
   }
+}
+
+function renderXrFallbackViews(pose: XRViewerPose) {
+  const gl = xrGlContext;
+  const layer = xrGlLayer;
+  if (!gl || !layer) {
+    return;
+  }
+
+  const pipeline = getRayMarchPipeline(presentationFormat);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+
+  for (const view of pose.views) {
+    updateCameraFromXrView(view);
+    pipeline
+      .withColorAttachment({
+        view: context.getCurrentTexture().createView(),
+        loadOp: 'clear',
+        storeOp: 'store',
+      })
+      .with(bindGroups.rayMarch)
+      .draw(3);
+
+    const viewport = layer.getViewport(view);
+    if (!viewport) {
+      continue;
+    }
+
+    gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
+    copyCanvasToXrGlTexture(gl);
+    drawXrGlQuad(gl);
+  }
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
 function onXrSessionEnded() {
@@ -1434,6 +1842,7 @@ function onXrSessionEnded() {
   xrRefSpace = null;
   xrGpuBinding = null;
   xrProjectionLayer = null;
+  xrGlLayer = null;
   isPresentingXr = false;
    activeXrMode = null;
    interactionOnlyUniform.write(d.u32(0));
@@ -1443,14 +1852,15 @@ function onXrSessionEnded() {
   xrHandInteraction.isPinching = false;
   commitHandJointUniform(0);
   sliderInputX = eventHandler.currentMouseX;
+  handleResize();
   setXrButtonState(
     xrVrButton,
-    xrVrSupported ? 'Enter VR' : 'VR not supported',
+    xrVrSupported ? getXrEnterLabel('VR') : 'VR not supported',
     !xrVrSupported,
   );
   setXrButtonState(
     xrArButton,
-    xrArSupported ? 'Enter AR' : 'AR not supported',
+    xrArSupported ? getXrEnterLabel('AR') : 'AR not supported',
     !xrArSupported,
   );
 
@@ -1461,7 +1871,7 @@ function onXrSessionEnded() {
 }
 
 function onXrFrame(time: DOMHighResTimeStamp, frame: XRFrame) {
-  if (!xrSession || !xrRefSpace || !xrGpuBinding || !xrProjectionLayer) {
+  if (!xrSession || !xrRefSpace) {
     return;
   }
 
@@ -1476,24 +1886,31 @@ function onXrFrame(time: DOMHighResTimeStamp, frame: XRFrame) {
   const handOverride = updateXrHandInteraction(frame, time);
   updateSimulation(deltaTime, handOverride);
 
-  const xrFormat = xrColorFormat ?? RAY_MARCH_FORMAT;
-  const xrPipeline = getRayMarchPipeline(xrFormat);
+  if (xrGpuBinding && xrProjectionLayer) {
+    const xrFormat = xrColorFormat ?? RAY_MARCH_FORMAT;
+    const xrPipeline = getRayMarchPipeline(xrFormat);
 
-  for (const view of pose.views) {
-    updateCameraFromXrView(view);
-    const subImage = xrGpuBinding.getViewSubImage(xrProjectionLayer, view);
-    const colorView = subImage.colorTexture.createView(
-      subImage.getViewDescriptor(),
-    );
+    for (const view of pose.views) {
+      updateCameraFromXrView(view);
+      const subImage = xrGpuBinding.getViewSubImage(xrProjectionLayer, view);
+      const colorView = subImage.colorTexture.createView(
+        subImage.getViewDescriptor(),
+      );
 
-    xrPipeline
-      .withColorAttachment({
-        view: colorView,
-        loadOp: 'clear',
-        storeOp: 'store',
-      })
-      .with(bindGroups.rayMarch)
-      .draw(3);
+      xrPipeline
+        .withColorAttachment({
+          view: colorView,
+          loadOp: 'clear',
+          storeOp: 'store',
+        })
+        .with(bindGroups.rayMarch)
+        .draw(3);
+    }
+    return;
+  }
+
+  if (xrGlLayer) {
+    renderXrFallbackViews(pose);
   }
 }
 
@@ -1558,10 +1975,15 @@ function updateXrHandInteraction(
       }
     }
     if (inputSource.gamepad) {
-      const controllerCandidate = collectControllerSourceData(
+      const {
+        nextIndex,
+        candidate: controllerCandidate,
+      } = collectControllerSourceData(
         frame,
         inputSource,
+        jointWriteIndex,
       );
+      jointWriteIndex = nextIndex;
       if (controllerCandidate) {
         candidates.push(controllerCandidate);
       }
@@ -1757,12 +2179,13 @@ function collectHandSourceData(
 function collectControllerSourceData(
   frame: XRFrame,
   inputSource: XRInputSource,
-): XrHandCandidate | null {
+  writeIndex: number,
+): { nextIndex: number; candidate: XrHandCandidate | null } {
   if (
     !xrRefSpace ||
     inputSource.handedness === 'none'
   ) {
-    return null;
+    return { nextIndex: writeIndex, candidate: null };
   }
 
   const point = getControllerInteractionPoint(frame, inputSource);
@@ -1770,7 +2193,14 @@ function collectControllerSourceData(
     logXrDebug('Controller interaction point unavailable', {
       handedness: inputSource.handedness,
     });
-    return null;
+    return { nextIndex: writeIndex, candidate: null };
+  }
+
+  let nextIndex = writeIndex;
+  if (!inputSource.hand && writeIndex < MAX_HAND_JOINTS) {
+    const proxyRadius = 0.018;
+    writeHandJointData(writeIndex, point, proxyRadius, inputSource.handedness);
+    nextIndex++;
   }
 
   const isPressed = isControllerActionPressed(inputSource);
@@ -1780,12 +2210,15 @@ function collectControllerSourceData(
     point,
   });
 
-  return createHandCandidateFromPoint(
-    point,
-    inputSource.handedness,
-    isPressed,
-    XR_CONTROLLER_Z_THRESHOLD,
-  );
+  return {
+    nextIndex,
+    candidate: createHandCandidateFromPoint(
+      point,
+      inputSource.handedness,
+      isPressed,
+      XR_CONTROLLER_Z_THRESHOLD,
+    ),
+  };
 }
 
 function writeHandJointData(
@@ -2018,6 +2451,7 @@ const resizeObserver = new ResizeObserver(() => {
   handleResize();
 });
 resizeObserver.observe(canvas);
+window.addEventListener('resize', () => handleResize());
 
 void setupXrButtons();
 requestAnimationFrame(render);
@@ -2106,6 +2540,17 @@ export const controls = {
 
       qualityScale = qualityMap[value] || 0.5;
       handleResize();
+    },
+  },
+  'XR Copy Quality (fallback)': {
+    initial: getFallbackQualityLabel(),
+    options: fallbackQualityOptions,
+    onSelectChange: (value: string) => {
+      const nextIndex = fallbackQualityOptions.indexOf(value);
+      applyFallbackResolution(
+        nextIndex >= 0 ? nextIndex : fallbackResolutionIndex,
+        isXrFallbackActive(),
+      );
     },
   },
   'Light dir': {

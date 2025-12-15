@@ -10,7 +10,11 @@ body.style.padding = '1rem';
 
 // Resize canvases
 for (const canvas of document.querySelectorAll('canvas')) {
-  if ('width' in canvas.attributes || 'height' in canvas.attributes) {
+  if (
+    'width' in canvas.attributes ||
+    'height' in canvas.attributes ||
+    canvas.dataset.nativeResolution === 'true'
+  ) {
     continue; // custom canvas, not replacing with resizable
   }
 

@@ -23,6 +23,9 @@ importers:
       '@typegpu/sdf':
         specifier: 0.8.0
         version: 0.8.0(typegpu@0.8.2)
+      '@vitejs/plugin-basic-ssl':
+        specifier: ^2.1.0
+        version: 2.1.0(vite@6.4.1)
       typegpu:
         specifier: ^0.8.2
         version: 0.8.2
@@ -389,6 +392,12 @@ packages:
 
   '@types/webxr@0.5.24':
     resolution: {integrity: sha512-h8fgEd/DpoS9CBrjEQXR+dIDraopAEfu4wYVNY2tEPwk60stPWhvZMf4Foo5FakuQ7HFZoa8WceaWFervK2Ovg==}
+
+  '@vitejs/plugin-basic-ssl@2.1.0':
+    resolution: {integrity: sha512-dOxxrhgyDIEUADhb/8OlV9JIqYLgos03YorAueTIeOUskLJSEsfwCByjbu98ctXitUN3znXKp0bYD/WHSudCeA==}
+    engines: {node: ^18.0.0 || ^20.0.0 || >=22.0.0}
+    peerDependencies:
+      vite: ^6.0.0 || ^7.0.0
 
   '@webgpu/types@0.1.66':
     resolution: {integrity: sha512-YA2hLrwLpDsRueNDXIMqN9NTzD6bCDkuXbOSe0heS+f8YE8usA6Gbv1prj81pzVHrbaAma7zObnIC+I6/sXJgA==}
@@ -759,6 +768,10 @@ snapshots:
   '@types/geojson@7946.0.16': {}
 
   '@types/webxr@0.5.24': {}
+
+  '@vitejs/plugin-basic-ssl@2.1.0(vite@6.4.1)':
+    dependencies:
+      vite: 6.4.1
 
   '@webgpu/types@0.1.66': {}
 

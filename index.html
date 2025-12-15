@@ -58,6 +58,15 @@
   #attribution a:hover {
     text-decoration: underline;
   }
+
+  canvas[data-native-resolution="true"] {
+    width: min(80vmin, 560px);
+    max-width: 90vw;
+    aspect-ratio: 1 / 1;
+    border-radius: 1rem;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+    background-color: #05060c;
+  }
 </style>
 
 <div id="attribution">
@@ -69,7 +78,7 @@
   <button id="xr-button" disabled>Checking VR support…</button>
   <button id="xr-ar-button" disabled>Checking AR support…</button>
 </div>
-<canvas></canvas>
+<canvas data-native-resolution="true"></canvas>
 
 <script type="module" src="/index.ts"></script>
 </body>

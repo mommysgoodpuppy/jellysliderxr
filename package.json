@@ -4,7 +4,7 @@
     "version": "0.0.0",
     "type": "module",
     "scripts": {
-        "dev": "vite",
+        "dev": "vite --host",
         "build": "vite build",
         "preview": "vite preview"
     },
@@ -20,6 +20,7 @@
         "@typegpu/color": "0.8.0",
         "@typegpu/noise": "0.8.0",
         "@typegpu/sdf": "0.8.0",
+        "@vitejs/plugin-basic-ssl": "^2.1.0",
         "typegpu": "^0.8.2",
         "unplugin-typegpu": "^0.8.0",
         "wgpu-matrix": "^3.4.0"
