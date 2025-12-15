@@ -7,20 +7,25 @@
 </head>
 <body>
 <style>
-  #xr-button {
+  #xr-controls {
     position: absolute;
     top: 1rem;
     right: 1rem;
+    display: flex;
+    gap: 0.5rem;
+    z-index: 3;
+  }
+
+  #xr-controls button {
     padding: 0.5rem 1rem;
     border-radius: 0.5rem;
     border: none;
     background: rgba(0, 0, 0, 0.75);
     color: white;
     cursor: pointer;
-    z-index: 3;
   }
 
-  #xr-button:disabled {
+  #xr-controls button:disabled {
     opacity: 0.4;
     cursor: not-allowed;
   }
@@ -60,7 +65,10 @@
   <a href="https://x.com/cerpow/status/1964953851603358112" target="_blank"
   >Voicu Apostol</a>
 </div>
-<button id="xr-button" disabled>Checking VR support…</button>
+<div id="xr-controls">
+  <button id="xr-button" disabled>Checking VR support…</button>
+  <button id="xr-ar-button" disabled>Checking AR support…</button>
+</div>
 <canvas></canvas>
 
 <script type="module" src="/index.ts"></script>

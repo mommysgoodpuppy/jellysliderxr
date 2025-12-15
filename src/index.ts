@@ -50,7 +50,8 @@ import { NumberProvider } from './numbers.ts';
 const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
 const canvas = document.querySelector('canvas') as HTMLCanvasElement;
 const context = canvas.getContext('webgpu') as GPUCanvasContext;
-const xrButton = document.getElementById('xr-button') as HTMLButtonElement | null;
+const xrVrButton = document.getElementById('xr-button') as HTMLButtonElement | null;
+const xrArButton = document.getElementById('xr-ar-button') as HTMLButtonElement | null;
 
 const root = await tgpu.init({
   adapter: {
@@ -69,15 +70,20 @@ context.configure({
 
 const NUM_POINTS = 17;
 
+const SLIDER_START = d.vec2f(-1, 0);
+const SLIDER_END = d.vec2f(0.9, 0);
+const SLIDER_Y_OFFSET = -0.03;
+
 const slider = new Slider(
   root,
-  d.vec2f(-1, 0),
-  d.vec2f(0.9, 0),
+  SLIDER_START,
+  SLIDER_END,
   NUM_POINTS,
-  -0.03,
+  SLIDER_Y_OFFSET,
 );
 const bezierTexture = slider.bezierTexture.createView();
 const bezierBbox = slider.bbox;
+const interactionPlaneHeight = (SLIDER_START[1] ?? 0) + SLIDER_Y_OFFSET;
 
 const digitsProvider = new NumberProvider(root);
 await digitsProvider.fillAtlas();
@@ -177,6 +183,15 @@ const XR_HAND_X_MARGIN = 0.12;
 const XR_HAND_Y_MARGIN = 0.12;
 const XR_HAND_RELEASE_MS = 150;
 const XR_HAND_SMOOTHING = 0.35;
+const XR_CONTROLLER_Z_THRESHOLD = 0.18;
+const XR_CONTROLLER_ACTION_THRESHOLD = 0.35;
+const XR_CONTROLLER_BUTTON_INDICES = [0, 1, 3, 4];
+const XR_DEBUG_LOGS = false;
+
+function logXrDebug(...args: unknown[]) {
+  if (!XR_DEBUG_LOGS) return;
+  console.log('[XR]', ...args);
+}
 
 interface XrHandCandidate {
   dragX: number;
@@ -221,6 +236,11 @@ const jellyColorUniform = root.createUniform(
 
 const randomUniform = root.createUniform(d.vec2f);
 const blurEnabledUniform = root.createUniform(d.u32);
+const interactionOnlyUniform = root.createUniform(d.u32, d.u32(0));
+const interactionPlaneUniform = root.createUniform(
+  d.f32,
+  d.f32(interactionPlaneHeight),
+);
 
 const getRay = (ndc: d.v2f) => {
   'use gpu';
@@ -752,6 +772,9 @@ const renderBackground = (
   offset: number,
 ) => {
   'use gpu';
+  if (interactionOnlyUniform.$ === 1) {
+    return d.vec4f();
+  }
   const hitPosition = rayOrigin.add(rayDirection.mul(backgroundHitDist));
 
   const percentageSample = renderPercentageOnGround(
@@ -841,6 +864,58 @@ const renderBackground = (
   );
 };
 
+const renderInteractionOverlay = (
+  rayOrigin: d.v3f,
+  rayDirection: d.v3f,
+) => {
+  'use gpu';
+  const planeY = interactionPlaneUniform.$;
+  const denom = rayDirection.y;
+  if (std.abs(denom) < 1e-4) {
+    return d.vec4f();
+  }
+  const t = (planeY - rayOrigin.y) / denom;
+  if (t <= 0.0) {
+    return d.vec4f();
+  }
+  const hitPosition = rayOrigin.add(rayDirection.mul(t));
+
+  const bbox = getSliderBbox();
+  const left = bbox.left - XR_HAND_X_MARGIN;
+  const right = bbox.right + XR_HAND_X_MARGIN;
+  const bottom = bbox.bottom - XR_HAND_Y_MARGIN;
+  const top = bbox.top + XR_HAND_Y_MARGIN;
+  const depth = XR_HAND_RENDER_MARGIN;
+
+  if (
+    hitPosition.x < left ||
+    hitPosition.x > right ||
+    hitPosition.y < bottom ||
+    hitPosition.y > top ||
+    std.abs(hitPosition.z) > depth
+  ) {
+    return d.vec4f();
+  }
+
+  const u = std.saturate((hitPosition.x - left) / (right - left));
+  const v = std.saturate((hitPosition.z + depth) / (depth * 2));
+  const edge = std.min(
+    std.min(u, 1 - u),
+    std.min(v, 1 - v),
+  );
+  const highlight = std.smoothstep(0.0, 0.3, edge);
+  const rim = std.smoothstep(0.0, 0.05, edge);
+  const tint = d.vec3f(0.12, 0.6, 1.0);
+  const color = tint.mul(0.25 + highlight * 0.65);
+  const rimColor = d.vec3f(0.9, 0.95, 1.0).mul(rim * 0.4);
+
+  const grid = std.sin((u + v) * 40.0) * 0.02;
+  const finalColor = std.saturate(color.add(rimColor).add(d.vec3f(grid)));
+  const alpha = 0.15 + highlight * 0.25;
+
+  return d.vec4f(finalColor, alpha);
+};
+
 const renderHandJoint = (
   hitPosition: d.v3f,
   hitInfo: d.Infer<typeof HitInfo>,
@@ -882,21 +957,32 @@ const rayMarch = (rayOrigin: d.v3f, rayDirection: d.v3f, uv: d.v2f) => {
   'use gpu';
   let totalSteps = d.u32();
 
+  const isInteractionOnly = interactionOnlyUniform.$ === 1;
+
   let backgroundDist = d.f32();
-  for (let i = 0; i < MAX_STEPS; i++) {
-    const p = rayOrigin.add(rayDirection.mul(backgroundDist));
-    const hit = getMainSceneDist(p);
-    backgroundDist += hit;
-    if (hit < SURF_DIST) {
-      break;
-    }
+  if (isInteractionOnly) {
+    backgroundDist = d.f32(MAX_DIST);
   }
-  const background = renderBackground(
-    rayOrigin,
-    rayDirection,
-    backgroundDist,
-    d.f32(),
-  );
+  let background = d.vec4f();
+
+  if (isInteractionOnly) {
+    background = renderInteractionOverlay(rayOrigin, rayDirection);
+  } else {
+    for (let i = 0; i < MAX_STEPS; i++) {
+      const p = rayOrigin.add(rayDirection.mul(backgroundDist));
+      const hit = getMainSceneDist(p);
+      backgroundDist += hit;
+      if (hit < SURF_DIST) {
+        break;
+      }
+    }
+    background = renderBackground(
+      rayOrigin,
+      rayDirection,
+      backgroundDist,
+      d.f32(),
+    );
+  }
 
   const bbox = getSliderBbox();
   const zDepth = d.f32(0.25);
@@ -997,7 +1083,7 @@ const rayMarch = (rayOrigin: d.v3f, rayDirection: d.v3f, uv: d.v2f) => {
       break;
     }
 
-    if (distanceFromOrigin > backgroundDist) {
+    if (!isInteractionOnly && distanceFromOrigin > backgroundDist) {
       break;
     }
   }
@@ -1073,6 +1159,9 @@ let xrGpuBinding: XRGPUBinding | null = null;
 let xrProjectionLayer: XRProjectionLayer | null = null;
 let xrColorFormat: GPUTextureFormat | null = null;
 let isPresentingXr = false;
+let activeXrMode: XRSessionMode | null = null;
+let xrVrSupported = false;
+let xrArSupported = false;
 
 let attributionDismissed = false;
 const attributionElement = document.getElementById(
@@ -1187,60 +1276,95 @@ function handleResize() {
   bindGroups = createBindGroups();
 }
 
-async function setupXrButton() {
-  if (!xrButton) {
-    return;
-  }
-
+async function setupXrButtons() {
   if (!navigator.xr) {
-    xrButton.textContent = 'WebXR unavailable';
+    setXrButtonState(xrVrButton, 'WebXR unavailable', true);
+    setXrButtonState(xrArButton, 'WebXR unavailable', true);
     return;
   }
 
   if (!navigator.gpu) {
-    xrButton.textContent = 'WebGPU unavailable';
+    setXrButtonState(xrVrButton, 'WebGPU unavailable', true);
+    setXrButtonState(xrArButton, 'WebGPU unavailable', true);
     return;
   }
 
   if (!('XRGPUBinding' in window)) {
-    xrButton.textContent = 'XR/WebGPU unsupported';
+    setXrButtonState(xrVrButton, 'XR/WebGPU unsupported', true);
+    setXrButtonState(xrArButton, 'XR/WebGPU unsupported', true);
     return;
   }
 
-  const supported = await navigator.xr.isSessionSupported('immersive-vr');
-  if (!supported) {
-    xrButton.textContent = 'VR not supported';
-    return;
-  }
+  const [vrSupported, arSupported] = await Promise.all([
+    navigator.xr.isSessionSupported('immersive-vr'),
+    navigator.xr.isSessionSupported('immersive-ar'),
+  ]);
+  xrVrSupported = vrSupported;
+  xrArSupported = arSupported;
 
-  xrButton.disabled = false;
-  xrButton.textContent = 'Enter VR';
-  xrButton.addEventListener('click', () => {
-    if (xrSession) {
-      xrSession.end();
-    } else {
-      void startXrSession();
-    }
-  });
+  configureXrButton(xrVrButton, vrSupported, 'VR', 'immersive-vr');
+  configureXrButton(xrArButton, arSupported, 'AR', 'immersive-ar');
 }
 
-async function startXrSession() {
+function setXrButtonState(
+  button: HTMLButtonElement | null,
+  text: string,
+  disabled: boolean,
+) {
+  if (!button) return;
+  button.textContent = text;
+  button.disabled = disabled;
+}
+
+function configureXrButton(
+  button: HTMLButtonElement | null,
+  supported: boolean,
+  label: string,
+  mode: XRSessionMode,
+) {
+  if (!button) return;
+  if (!supported) {
+    setXrButtonState(button, `${label} not supported`, true);
+    return;
+  }
+  setXrButtonState(button, `Enter ${label}`, false);
+  button.onclick = () => {
+    if (xrSession && activeXrMode === mode) {
+      xrSession.end();
+    } else if (!xrSession) {
+      void startXrSession(mode);
+    }
+  };
+}
+
+async function startXrSession(mode: XRSessionMode) {
   if (!navigator.xr) {
     return;
   }
 
-  if (xrButton) {
-    xrButton.disabled = true;
-    xrButton.textContent = 'Starting…';
+  const targetButton = mode === 'immersive-vr' ? xrVrButton : xrArButton;
+  const otherButton = mode === 'immersive-vr' ? xrArButton : xrVrButton;
+
+  if (targetButton) {
+    setXrButtonState(
+      targetButton,
+      mode === 'immersive-vr' ? 'Starting VR…' : 'Starting AR…',
+      true,
+    );
+  }
+  if (otherButton) {
+    otherButton.disabled = true;
   }
 
   try {
-    const session = await navigator.xr.requestSession('immersive-vr', {
+    const session = await navigator.xr.requestSession(mode, {
       requiredFeatures: ['webgpu'],
       optionalFeatures: ['hand-tracking'],
     });
     xrSession = session;
     isPresentingXr = true;
+    activeXrMode = mode;
+    interactionOnlyUniform.write(d.u32(mode === 'immersive-ar' ? 1 : 0));
 
     session.addEventListener('end', onXrSessionEnded);
 
@@ -1256,9 +1380,15 @@ async function startXrSession() {
 
     xrRefSpace = await session.requestReferenceSpace('local');
 
-    if (xrButton) {
-      xrButton.disabled = false;
-      xrButton.textContent = 'Exit VR';
+    if (targetButton) {
+      setXrButtonState(
+        targetButton,
+        mode === 'immersive-vr' ? 'Exit VR' : 'Exit AR',
+        false,
+      );
+    }
+    if (otherButton) {
+      otherButton.disabled = true;
     }
 
     session.requestAnimationFrame(onXrFrame);
@@ -1269,15 +1399,31 @@ async function startXrSession() {
     xrGpuBinding = null;
     xrProjectionLayer = null;
     isPresentingXr = false;
+    activeXrMode = null;
+    interactionOnlyUniform.write(d.u32(0));
     xrHandInteraction.dragX = null;
     xrHandInteraction.activeHand = null;
     xrHandInteraction.lastSeenTime = 0;
     xrHandInteraction.isPinching = false;
     commitHandJointUniform(0);
     sliderInputX = eventHandler.currentMouseX;
-    if (xrButton) {
-      xrButton.disabled = false;
-      xrButton.textContent = 'Enter VR';
+    if (targetButton) {
+      const supported = mode === 'immersive-vr' ? xrVrSupported : xrArSupported;
+      const label = mode === 'immersive-vr' ? 'VR' : 'AR';
+      setXrButtonState(
+        targetButton,
+        supported ? `Enter ${label}` : `${label} not supported`,
+        !supported,
+      );
+    }
+    if (otherButton) {
+      const supported = mode === 'immersive-vr' ? xrArSupported : xrVrSupported;
+      const label = mode === 'immersive-vr' ? 'AR' : 'VR';
+      setXrButtonState(
+        otherButton,
+        supported ? `Enter ${label}` : `${label} not supported`,
+        !supported,
+      );
     }
     requestAnimationFrame(render);
   }
@@ -1289,16 +1435,24 @@ function onXrSessionEnded() {
   xrGpuBinding = null;
   xrProjectionLayer = null;
   isPresentingXr = false;
+   activeXrMode = null;
+   interactionOnlyUniform.write(d.u32(0));
   xrHandInteraction.dragX = null;
   xrHandInteraction.activeHand = null;
   xrHandInteraction.lastSeenTime = 0;
   xrHandInteraction.isPinching = false;
   commitHandJointUniform(0);
   sliderInputX = eventHandler.currentMouseX;
-  if (xrButton) {
-    xrButton.disabled = false;
-    xrButton.textContent = 'Enter VR';
-  }
+  setXrButtonState(
+    xrVrButton,
+    xrVrSupported ? 'Enter VR' : 'VR not supported',
+    !xrVrSupported,
+  );
+  setXrButtonState(
+    xrArButton,
+    xrArSupported ? 'Enter AR' : 'AR not supported',
+    !xrArSupported,
+  );
 
   camera.updateView(baseCameraPosition, baseCameraTarget, baseCameraUp);
   camera.updateProjection(Math.PI / 4, width, height);
@@ -1379,7 +1533,7 @@ function updateXrHandInteraction(
   frame: XRFrame,
   time: DOMHighResTimeStamp,
 ): number | null {
-  if (!xrSession || !xrRefSpace || !frame.getJointPose) {
+  if (!xrSession || !xrRefSpace) {
     commitHandJointUniform(0);
     if (time - xrHandInteraction.lastSeenTime > XR_HAND_RELEASE_MS) {
       releaseHandInteraction();
@@ -1391,19 +1545,39 @@ function updateXrHandInteraction(
   let bestCandidate: XrHandCandidate | null = null;
   let activeCandidate: XrHandCandidate | null = null;
   for (const inputSource of xrSession.inputSources) {
-    const { nextIndex, candidate } = collectHandSourceData(
-      frame,
-      inputSource,
-      jointWriteIndex,
-    );
-    jointWriteIndex = nextIndex;
+    const candidates: XrHandCandidate[] = [];
+    if (inputSource.hand) {
+      const { nextIndex, candidate: handCandidate } = collectHandSourceData(
+        frame,
+        inputSource,
+        jointWriteIndex,
+      );
+      jointWriteIndex = nextIndex;
+      if (handCandidate) {
+        candidates.push(handCandidate);
+      }
+    }
+    if (inputSource.gamepad) {
+      const controllerCandidate = collectControllerSourceData(
+        frame,
+        inputSource,
+      );
+      if (controllerCandidate) {
+        candidates.push(controllerCandidate);
+      }
+    }
 
-    if (candidate) {
+    for (const candidate of candidates) {
       if (!bestCandidate || candidate.score < bestCandidate.score) {
         bestCandidate = candidate;
       }
       if (candidate.handedness === xrHandInteraction.activeHand) {
-        activeCandidate = candidate;
+        if (
+          !activeCandidate ||
+          candidate.score < activeCandidate.score
+        ) {
+          activeCandidate = candidate;
+        }
       }
     }
   }
@@ -1420,6 +1594,7 @@ function updateXrHandInteraction(
     if (time - xrHandInteraction.lastSeenTime > XR_HAND_RELEASE_MS) {
       releaseHandInteraction();
     }
+    logXrDebug('Active XR drag lost candidate; waiting for release timeout');
     return xrHandInteraction.dragX;
   }
 
@@ -1427,6 +1602,7 @@ function updateXrHandInteraction(
     if (time - xrHandInteraction.lastSeenTime > XR_HAND_RELEASE_MS) {
       releaseHandInteraction();
     }
+    logXrDebug('No XR candidates available this frame');
     return xrHandInteraction.dragX;
   }
 
@@ -1434,6 +1610,11 @@ function updateXrHandInteraction(
     if (isCurrentlyActive) {
       releaseHandInteraction();
     }
+    logXrDebug('XR candidate not interacting because pinch/button not active', {
+      handedness: candidate.handedness,
+      withinBounds: candidate.withinBounds,
+      tipDistance: candidate.tipDistance,
+    });
     return xrHandInteraction.dragX;
   }
 
@@ -1444,11 +1625,21 @@ function updateXrHandInteraction(
       !candidate.withinBounds ||
       candidate.tipDistance > XR_HAND_CAPTURE_RADIUS
     ) {
+      logXrDebug('XR candidate skipped (outside capture range)', {
+        handedness: candidate.handedness,
+        withinBounds: candidate.withinBounds,
+        tipDistance: candidate.tipDistance,
+      });
       return xrHandInteraction.dragX;
     }
     xrHandInteraction.dragX = candidate.dragX;
     xrHandInteraction.activeHand = candidate.handedness;
     xrHandInteraction.isPinching = true;
+    logXrDebug('XR candidate captured slider', {
+      handedness: candidate.handedness,
+      dragX: candidate.dragX,
+      tipDistance: candidate.tipDistance,
+    });
     return xrHandInteraction.dragX;
   }
 
@@ -1468,6 +1659,14 @@ function updateXrHandInteraction(
   xrHandInteraction.dragX = smoothed;
   xrHandInteraction.activeHand = candidate.handedness;
   xrHandInteraction.isPinching = true;
+  if (XR_DEBUG_LOGS && Math.abs(smoothed - previous) > 0.01) {
+    logXrDebug('XR drag updated', {
+      handedness: candidate.handedness,
+      dragX: smoothed,
+      desired,
+      tipDistance: candidate.tipDistance,
+    });
+  }
   return xrHandInteraction.dragX;
 }
 
@@ -1475,6 +1674,7 @@ function releaseHandInteraction() {
   xrHandInteraction.dragX = null;
   xrHandInteraction.activeHand = null;
   xrHandInteraction.isPinching = false;
+  logXrDebug('XR interaction released');
 }
 
 type Vec3Tuple = [number, number, number];
@@ -1533,14 +1733,59 @@ function collectHandSourceData(
     pinchDistance = distanceBetweenPoints(candidatePoint, thumbTipPoint);
   }
   const isPinching = pinchDistance < XR_PINCH_MAX_DISTANCE;
+  const actionPressed = inputSource.gamepad
+    ? isControllerActionPressed(inputSource)
+    : false;
 
   const candidate = createHandCandidateFromPoint(
     candidatePoint,
     handedness,
-    isPinching,
+    isPinching || actionPressed,
   );
+  logXrDebug('Hand candidate', {
+    handedness,
+    isPinching: candidate?.isPinching,
+    pointer: candidatePoint,
+    withinBounds: candidate?.withinBounds,
+    tipDistance: candidate?.tipDistance,
+    actionPressed,
+  });
 
   return { nextIndex: writeIndex, candidate };
+}
+
+function collectControllerSourceData(
+  frame: XRFrame,
+  inputSource: XRInputSource,
+): XrHandCandidate | null {
+  if (
+    !xrRefSpace ||
+    inputSource.handedness === 'none'
+  ) {
+    return null;
+  }
+
+  const point = getControllerInteractionPoint(frame, inputSource);
+  if (!point) {
+    logXrDebug('Controller interaction point unavailable', {
+      handedness: inputSource.handedness,
+    });
+    return null;
+  }
+
+  const isPressed = isControllerActionPressed(inputSource);
+  logXrDebug('Controller candidate', {
+    handedness: inputSource.handedness,
+    isPressed,
+    point,
+  });
+
+  return createHandCandidateFromPoint(
+    point,
+    inputSource.handedness,
+    isPressed,
+    XR_CONTROLLER_Z_THRESHOLD,
+  );
 }
 
 function writeHandJointData(
@@ -1577,14 +1822,15 @@ function createHandCandidateFromPoint(
   point: Vec3Tuple,
   handedness: XRHandedness,
   isPinching: boolean,
+  zThreshold = XR_HAND_Z_THRESHOLD,
 ): XrHandCandidate {
-  const withinBounds = pointWithinSliderBounds(point);
+  const withinBounds = pointWithinSliderBounds(point, zThreshold);
   const [top, , bottom] = bezierBbox;
   const sliderMidY = (top + bottom) * 0.5;
   const verticalRange = Math.max(0.001, top - bottom);
   const normalizedY = Math.abs(point[1] - sliderMidY) /
     (verticalRange * 0.5 + XR_HAND_Y_MARGIN);
-  const normalizedZ = Math.abs(point[2]) / XR_HAND_Z_THRESHOLD;
+  const normalizedZ = Math.abs(point[2]) / zThreshold;
   const sliderTipX = slider.tipX;
   const tipDistance = Math.abs(point[0] - sliderTipX);
   const score = tipDistance + normalizedY * 0.35 + normalizedZ * 0.5;
@@ -1599,14 +1845,17 @@ function createHandCandidateFromPoint(
   };
 }
 
-function pointWithinSliderBounds([x, y, z]: Vec3Tuple) {
+function pointWithinSliderBounds(
+  [x, y, z]: Vec3Tuple,
+  zThreshold = XR_HAND_Z_THRESHOLD,
+) {
   const [top, right, bottom, left] = bezierBbox;
   return (
     x >= left - XR_HAND_X_MARGIN &&
     x <= right + XR_HAND_X_MARGIN &&
     y >= bottom - XR_HAND_Y_MARGIN &&
     y <= top + XR_HAND_Y_MARGIN &&
-    Math.abs(z) <= XR_HAND_Z_THRESHOLD
+    Math.abs(z) <= zThreshold
   );
 }
 
@@ -1615,6 +1864,123 @@ function distanceBetweenPoints(a: Vec3Tuple, b: Vec3Tuple) {
   const dy = a[1] - b[1];
   const dz = a[2] - b[2];
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function getControllerInteractionPoint(
+  frame: XRFrame,
+  inputSource: XRInputSource,
+): Vec3Tuple | null {
+  if (!xrRefSpace) {
+    return null;
+  }
+
+  if (inputSource.gripSpace) {
+    const gripPose = frame.getPose(inputSource.gripSpace, xrRefSpace);
+    if (gripPose) {
+      const gripPoint = transformPoint(
+        xrSceneTransformInv,
+        gripPose.transform.position,
+      );
+      if (Math.abs(gripPoint[2]) <= XR_CONTROLLER_Z_THRESHOLD * 2) {
+        logXrDebug('Using controller grip pose for interaction', {
+          handedness: inputSource.handedness,
+          point: gripPoint,
+        });
+        return gripPoint;
+      }
+    }
+  }
+
+  if (!inputSource.targetRaySpace) {
+    return null;
+  }
+
+  const rayPose = frame.getPose(inputSource.targetRaySpace, xrRefSpace);
+  if (!rayPose) {
+    return null;
+  }
+
+  const origin = transformPoint(
+    xrSceneTransformInv,
+    rayPose.transform.position,
+  );
+  const direction = transformDirection(rayPose.transform.orientation);
+  if (!direction) {
+    return null;
+  }
+
+  const zComponent = direction[2];
+  if (Math.abs(zComponent) < 1e-4) {
+    return null;
+  }
+
+  const t = -origin[2] / zComponent;
+  if (!Number.isFinite(t)) {
+    return null;
+  }
+
+  const intersection: Vec3Tuple = [
+    origin[0] + direction[0] * t,
+    origin[1] + direction[1] * t,
+    0,
+  ];
+  logXrDebug('Using controller target-ray intersection', {
+    handedness: inputSource.handedness,
+    origin,
+    direction,
+    point: intersection,
+  });
+  return intersection;
+}
+
+function isControllerActionPressed(inputSource: XRInputSource) {
+  const gamepad = inputSource.gamepad;
+  if (!gamepad) {
+    return false;
+  }
+
+  for (const index of XR_CONTROLLER_BUTTON_INDICES) {
+    const button = gamepad.buttons[index];
+    if (button && (button.pressed || button.value > XR_CONTROLLER_ACTION_THRESHOLD)) {
+      return true;
+    }
+  }
+
+  return gamepad.buttons.some((button) =>
+    button.pressed && button.value > XR_CONTROLLER_ACTION_THRESHOLD
+  );
+}
+
+function transformDirection(
+  orientation: DOMPointReadOnly | undefined,
+): Vec3Tuple | null {
+  if (!orientation) {
+    return null;
+  }
+  return rotateVectorByQuaternion([0, 0, -1], orientation);
+}
+
+function rotateVectorByQuaternion(
+  vector: Vec3Tuple,
+  orientation: DOMPointReadOnly,
+): Vec3Tuple {
+  const { x, y, z, w } = orientation;
+  const uvx = y * vector[2] - z * vector[1];
+  const uvy = z * vector[0] - x * vector[2];
+  const uvz = x * vector[1] - y * vector[0];
+
+  const uuvx = y * uvz - z * uvy;
+  const uuvy = z * uvx - x * uvz;
+  const uuvz = x * uvy - y * uvx;
+
+  const uvScale = 2 * w;
+  const uuvScale = 2;
+
+  return [
+    vector[0] + uvx * uvScale + uuvx * uuvScale,
+    vector[1] + uvy * uvScale + uuvy * uuvScale,
+    vector[2] + uvz * uvScale + uuvz * uuvScale,
+  ];
 }
 
 function mat4FromArrayLike(source: ArrayLike<number>) {
@@ -1653,7 +2019,7 @@ const resizeObserver = new ResizeObserver(() => {
 });
 resizeObserver.observe(canvas);
 
-void setupXrButton();
+void setupXrButtons();
 requestAnimationFrame(render);
 
 // #region Example controls and cleanup
