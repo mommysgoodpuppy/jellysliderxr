@@ -1150,6 +1150,7 @@ const fragmentMain = tgpu['~unstable'].fragmentFn({
 });
 
 const RAY_MARCH_FORMAT: GPUTextureFormat = 'rgba8unorm';
+const XR_DEPTH_FORMAT: GPUTextureFormat = 'depth24plus';
 const rayMarchPipelines = new Map<
   GPUTextureFormat,
   ReturnType<typeof createRayMarchPipeline>
@@ -1196,6 +1197,7 @@ let isPresentingXr = false;
 let activeXrMode: XRSessionMode | null = null;
 let xrVrSupported = false;
 let xrArSupported = false;
+let xrLoggedFormat = false;
 
 function isXrFallbackActive() {
   return Boolean(xrSession && !xrGpuBinding && xrGlLayer);
@@ -1754,8 +1756,14 @@ async function startXrSession(mode: XRSessionMode) {
       const preferredColorFormat =
         xrGpuBinding.getPreferredColorFormat() ?? presentationFormat;
       xrColorFormat = preferredColorFormat;
+      if (!xrLoggedFormat) {
+        console.log('[XR] Using color format', xrColorFormat);
+        xrLoggedFormat = true;
+      }
       const projectionLayer = xrGpuBinding.createProjectionLayer({
         colorFormat: preferredColorFormat,
+        depthStencilFormat: XR_DEPTH_FORMAT,
+        alphaMode: 'opaque',
       });
       xrProjectionLayer = projectionLayer;
       xrGlLayer = null;
@@ -1864,6 +1872,9 @@ function onXrSessionEnded() {
   xrProjectionLayer = null;
   xrGlLayer = null;
   isPresentingXr = false;
+  xrSceneTransformLocked = false;
+  setXrSceneTransformFromTranslation(XR_SCENE_TRANSLATION);
+  xrLoggedFormat = false;
    activeXrMode = null;
    interactionOnlyUniform.write(d.u32(0));
   xrHandInteraction.dragX = null;
@@ -1927,18 +1938,42 @@ function onXrFrame(time: DOMHighResTimeStamp, frame: XRFrame) {
     for (const view of pose.views) {
       updateCameraFromXrView(view);
       const subImage = xrGpuBinding.getViewSubImage(xrProjectionLayer, view);
-      const colorView = subImage.colorTexture.createView(
-        subImage.getViewDescriptor(),
-      );
+      const viewDescriptor = subImage.getViewDescriptor();
+      const colorView = subImage.colorTexture.createView(viewDescriptor);
+      const depthTexture = subImage.depthStencilTexture ?? null;
+      const depthView = depthTexture
+        ? depthTexture.createView(viewDescriptor)
+        : null;
 
-      xrPipeline
-        .withColorAttachment({
-          view: colorView,
-          loadOp: 'clear',
-          storeOp: 'store',
-        })
-        .with(bindGroups.rayMarch)
-        .draw(3);
+      const pass = xrPipeline.withColorAttachment({
+        view: colorView,
+        loadOp: 'clear',
+        storeOp: 'store',
+      });
+
+      if (depthView) {
+        pass.withDepthStencilAttachment({
+          view: depthView,
+          depthLoadOp: 'clear',
+          depthStoreOp: 'store',
+          depthClearValue: 1,
+        });
+      }
+
+    if (subImage.viewport) {
+      const vp = subImage.viewport;
+      // Vision Pro packs both eyes into one texture; viewport guards against overlap.
+      // The depth range is left at the default [0,1].
+        pass['setViewport'](vp.x, vp.y, vp.width, vp.height, 0, 1);
+        pass['setScissorRect'](
+          vp.x,
+          vp.y,
+          Math.max(0, vp.width),
+          Math.max(0, vp.height),
+        );
+      }
+
+      pass.with(bindGroups.rayMarch).draw(3);
     }
     return;
   }
