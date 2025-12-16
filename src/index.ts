@@ -135,24 +135,37 @@ const camera = new CameraController(
 const cameraUniform = camera.cameraUniform;
 
 const XR_SCENE_SCALE = 0.2;
-const XR_SCENE_TRANSLATION = [0, -0.45, -0.45] as const;
-const xrScaleMatrix = m.mat4.scaling(
-  [XR_SCENE_SCALE, XR_SCENE_SCALE, XR_SCENE_SCALE],
-  m.mat4.identity(),
-);
-const xrTranslationMatrix = m.mat4.translation(
-  XR_SCENE_TRANSLATION,
-  m.mat4.identity(),
-);
-const xrSceneTransform = m.mat4.mul(
-  xrTranslationMatrix,
-  xrScaleMatrix,
-  m.mat4.identity(),
-);
-const xrSceneTransformInv = m.mat4.invert(
-  xrSceneTransform,
-  m.mat4.identity(),
-) ?? m.mat4.identity();
+const XR_SCENE_TRANSLATION: Vec3Tuple = [0, -0.45, -0.45];
+const XR_HEADSET_FORWARD_OFFSET = 1.0;
+const XR_HEADSET_DOWN_OFFSET = 0.5;
+let xrUseHeadBasedPosition = false;
+let xrSceneTransformLocked = false;
+let xrSceneTranslation: Vec3Tuple = [...XR_SCENE_TRANSLATION];
+let xrSceneTransform = m.mat4.identity();
+let xrSceneTransformInv = m.mat4.identity();
+
+function setXrSceneTransformFromTranslation(translation: Vec3Tuple) {
+  xrSceneTranslation = translation;
+  const xrScaleMatrix = m.mat4.scaling(
+    [XR_SCENE_SCALE, XR_SCENE_SCALE, XR_SCENE_SCALE],
+    m.mat4.identity(),
+  );
+  const xrTranslationMatrix = m.mat4.translation(
+    translation,
+    m.mat4.identity(),
+  );
+  xrSceneTransform = m.mat4.mul(
+    xrTranslationMatrix,
+    xrScaleMatrix,
+    m.mat4.identity(),
+  );
+  xrSceneTransformInv = m.mat4.invert(
+    xrSceneTransform,
+    m.mat4.identity(),
+  ) ?? m.mat4.identity();
+}
+
+setXrSceneTransformFromTranslation(xrSceneTranslation);
 
 const MAX_HAND_JOINTS = 50;
 const XR_HAND_JOINTS: XRHandJoint[] = [
@@ -1698,6 +1711,11 @@ async function startXrSession(mode: XRSessionMode) {
     return;
   }
 
+  xrSceneTransformLocked = false;
+  if (!xrUseHeadBasedPosition) {
+    setXrSceneTransformFromTranslation(XR_SCENE_TRANSLATION);
+  }
+
   const targetButton = mode === 'immersive-vr' ? xrVrButton : xrArButton;
   const otherButton = mode === 'immersive-vr' ? xrArButton : xrVrButton;
 
@@ -1772,6 +1790,8 @@ async function startXrSession(mode: XRSessionMode) {
     xrProjectionLayer = null;
     xrGlLayer = null;
     isPresentingXr = false;
+    xrSceneTransformLocked = false;
+    setXrSceneTransformFromTranslation(XR_SCENE_TRANSLATION);
     activeXrMode = null;
     interactionOnlyUniform.write(d.u32(0));
     xrHandInteraction.dragX = null;
@@ -1880,6 +1900,20 @@ function onXrFrame(time: DOMHighResTimeStamp, frame: XRFrame) {
   const pose = frame.getViewerPose(xrRefSpace);
   if (!pose) {
     return;
+  }
+
+  if (xrUseHeadBasedPosition && !xrSceneTransformLocked) {
+    const headPos = pose.transform.position;
+    const forward = transformDirection(pose.transform.orientation) ??
+      ([0, 0, -1] as Vec3Tuple);
+    const translation: Vec3Tuple = [
+      headPos.x + forward[0] * XR_HEADSET_FORWARD_OFFSET,
+      headPos.y - XR_HEADSET_DOWN_OFFSET + forward[1] * XR_HEADSET_FORWARD_OFFSET,
+      headPos.z + forward[2] * XR_HEADSET_FORWARD_OFFSET,
+    ];
+    setXrSceneTransformFromTranslation(translation);
+    xrSceneTransformLocked = true;
+    logXrDebug('XR scene translated from headset', { translation, forward });
   }
 
   const deltaTime = getDeltaSeconds(time);
@@ -2577,6 +2611,16 @@ export const controls = {
     initial: false,
     onToggleChange: (v: boolean) => {
       blurEnabledUniform.write(d.u32(v));
+    },
+  },
+  'Position based on headset': {
+    initial: false,
+    onToggleChange: (v: boolean) => {
+      xrUseHeadBasedPosition = v;
+      xrSceneTransformLocked = false;
+      if (!v) {
+        setXrSceneTransformFromTranslation(XR_SCENE_TRANSLATION);
+      }
     },
   },
 };
