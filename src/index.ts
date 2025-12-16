@@ -1960,17 +1960,25 @@ function onXrFrame(time: DOMHighResTimeStamp, frame: XRFrame) {
         });
       }
 
-    if (subImage.viewport) {
-      const vp = subImage.viewport;
-      // Vision Pro packs both eyes into one texture; viewport guards against overlap.
-      // The depth range is left at the default [0,1].
-        pass['setViewport'](vp.x, vp.y, vp.width, vp.height, 0, 1);
-        pass['setScissorRect'](
-          vp.x,
-          vp.y,
-          Math.max(0, vp.width),
-          Math.max(0, vp.height),
-        );
+      if (subImage.viewport) {
+        const vp = subImage.viewport;
+        // Vision Pro packs both eyes into one texture; viewport guards against overlap.
+        // The depth range is left at the default [0,1].
+        const setViewport = (pass as unknown as { setViewport?: Function }).setViewport;
+        if (typeof setViewport === 'function') {
+          setViewport.call(pass, vp.x, vp.y, vp.width, vp.height, 0, 1);
+        }
+        const setScissor = (pass as unknown as { setScissorRect?: Function })
+          .setScissorRect;
+        if (typeof setScissor === 'function') {
+          setScissor.call(
+            pass,
+            vp.x,
+            vp.y,
+            Math.max(0, vp.width),
+            Math.max(0, vp.height),
+          );
+        }
       }
 
       pass.with(bindGroups.rayMarch).draw(3);
