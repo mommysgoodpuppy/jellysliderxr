@@ -30,6 +30,24 @@
     cursor: not-allowed;
   }
 
+  #xr-status {
+    position: absolute;
+    top: 3.75rem;
+    right: 1rem;
+    z-index: 3;
+    max-width: 19rem;
+    padding: 0.55rem 0.75rem;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 0.5rem;
+    background: rgba(0, 0, 0, 0.72);
+    color: white;
+    font-size: 0.8rem;
+    font-weight: 600;
+    line-height: 1.35;
+    text-align: right;
+    pointer-events: none;
+  }
+
   #attribution {
     opacity: 1;
     position: absolute;
@@ -59,6 +77,24 @@
     text-decoration: underline;
   }
 
+  #source-link {
+    position: absolute;
+    bottom: 0.625rem;
+    right: 1rem;
+    z-index: 2;
+    background-color: rgba(0, 0, 0, 0.7);
+    color: #87ceeb;
+    padding: 0.55rem 0.75rem;
+    border-radius: 0.5rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    text-decoration: none;
+  }
+
+  #source-link:hover {
+    text-decoration: underline;
+  }
+
   canvas[data-native-resolution="true"] {
     width: min(80vmin, 560px);
     max-width: 90vw;
@@ -74,10 +110,12 @@
   <a href="https://x.com/cerpow/status/1964953851603358112" target="_blank"
   >Voicu Apostol</a>
 </div>
+<a id="source-link" href="https://github.com/mommysgoodpuppy/jellysliderxr" target="_blank">Source</a>
 <div id="xr-controls">
   <button id="xr-button" disabled>Checking VR support…</button>
   <button id="xr-ar-button" disabled>Checking AR support…</button>
 </div>
+<div id="xr-status">XR path: checking support…</div>
 <canvas data-native-resolution="true"></canvas>
 
 <script type="module" src="/index.ts"></script>

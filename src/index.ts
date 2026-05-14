@@ -52,6 +52,7 @@ const canvas = document.querySelector('canvas') as HTMLCanvasElement;
 const context = canvas.getContext('webgpu') as GPUCanvasContext;
 const xrVrButton = document.getElementById('xr-button') as HTMLButtonElement | null;
 const xrArButton = document.getElementById('xr-ar-button') as HTMLButtonElement | null;
+const xrStatusElement = document.getElementById('xr-status') as HTMLDivElement | null;
 type XrCompatibleGl = WebGL2RenderingContext & {
   makeXRCompatible?: () => Promise<void>;
 };
@@ -64,6 +65,8 @@ const XR_FALLBACK_RESOLUTION_PRESETS = [
 ] as const;
 const XR_COPY_BASE_RESOLUTION = 2048;
 const XR_COPY_MIN_RESOLUTION = 960;
+const XR_PROJECTION_MIN_SCALE = 0.2;
+const XR_PROJECTION_MAX_DEFAULT_SCALE = 0.5;
 let fallbackResolutionIndex = 1;
 
 const root = await tgpu.init({
@@ -104,9 +107,10 @@ const digitsTextureView = digitsProvider.digitTextureAtlas.createView(
   d.texture2dArray(d.f32),
 );
 
-let qualityScale = 0.5;
+let qualityScale = XR_PROJECTION_MAX_DEFAULT_SCALE;
 let fallbackQualityScale = XR_FALLBACK_RESOLUTION_PRESETS[fallbackResolutionIndex].scale;
 let fallbackWarningElement: HTMLDivElement | null = null;
+let xrUseNativeBinding = xrWebGpuSupported;
 let [width, height] = [
   canvas.width * qualityScale,
   canvas.height * qualityScale,
@@ -1203,8 +1207,49 @@ function isXrFallbackActive() {
   return Boolean(xrSession && !xrGpuBinding && xrGlLayer);
 }
 
+function shouldUseNativeXrBinding() {
+  return xrWebGpuSupported && xrUseNativeBinding;
+}
+
 function getActiveQualityScale() {
   return qualityScale;
+}
+
+function getXrProjectionScale() {
+  return Math.max(
+    XR_PROJECTION_MIN_SCALE,
+    Math.min(1, qualityScale),
+  );
+}
+
+function getXrPathLabel() {
+  if (!navigator.xr) {
+    return 'XR path: WebXR unavailable';
+  }
+  if (!navigator.gpu) {
+    return 'XR path: WebGPU unavailable';
+  }
+  if (xrWebGpuSupported && !xrUseNativeBinding) {
+    return 'XRGPUBinding available: fallback selected';
+  }
+  return shouldUseNativeXrBinding()
+    ? 'XRGPUBinding available: native WebGPU/WebXR'
+    : 'XRGPUBinding unavailable: WebGL copy fallback';
+}
+
+function updateXrStatus() {
+  if (!xrStatusElement) {
+    return;
+  }
+
+  const pathLabel = getXrPathLabel();
+  const sessionLabel = xrSession
+    ? `active ${activeXrMode === 'immersive-ar' ? 'AR' : 'VR'}`
+    : 'not presenting';
+  const qualityLabel = shouldUseNativeXrBinding()
+    ? `XR scale ${Math.round(getXrProjectionScale() * 100)}%`
+    : `copy scale ${Math.round(fallbackQualityScale * 100)}%`;
+  xrStatusElement.textContent = `${pathLabel} · ${qualityLabel} · ${sessionLabel}`;
 }
 
 let attributionDismissed = false;
@@ -1336,15 +1381,18 @@ function handleResize() {
 }
 
 async function setupXrButtons() {
+  updateXrStatus();
   if (!navigator.xr) {
     setXrButtonState(xrVrButton, 'WebXR unavailable', true);
     setXrButtonState(xrArButton, 'WebXR unavailable', true);
+    updateXrStatus();
     return;
   }
 
   if (!navigator.gpu) {
     setXrButtonState(xrVrButton, 'WebGPU unavailable', true);
     setXrButtonState(xrArButton, 'WebGPU unavailable', true);
+    updateXrStatus();
     return;
   }
 
@@ -1362,6 +1410,7 @@ async function setupXrButtons() {
 
   configureXrButton(xrVrButton, vrSupported, 'VR', 'immersive-vr');
   configureXrButton(xrArButton, arSupported, 'AR', 'immersive-ar');
+  updateXrStatus();
 }
 
 function setXrButtonState(
@@ -1375,14 +1424,14 @@ function setXrButtonState(
 }
 
 function getXrEnterLabel(label: string) {
-  if (xrWebGpuSupported) {
+  if (shouldUseNativeXrBinding()) {
     return `Enter ${label}`;
   }
   return `Enter ${label}${XR_FALLBACK_LABEL_SUFFIX}`;
 }
 
 function getXrStartingLabel(label: string) {
-  if (xrWebGpuSupported) {
+  if (shouldUseNativeXrBinding()) {
     return `Starting ${label}…`;
   }
   return `Starting ${label}${XR_FALLBACK_LABEL_SUFFIX}…`;
@@ -1414,6 +1463,7 @@ function showFallbackWarning() {
     document.body.appendChild(warning);
   }
   fallbackWarningElement = warning;
+  updateXrStatus();
 }
 
 function getCanvasClientSize() {
@@ -1696,6 +1746,7 @@ function applyFallbackResolution(index: number, force = false) {
   if (force || (needsApply && isXrFallbackActive())) {
     handleResize();
   }
+  updateXrStatus();
 }
 
 const fallbackQualityOptions = XR_FALLBACK_RESOLUTION_PRESETS.map(
@@ -1706,6 +1757,40 @@ function getFallbackQualityLabel() {
   return fallbackQualityOptions[fallbackResolutionIndex] ||
     fallbackQualityOptions[0] ||
     'Balanced';
+}
+
+function createXrProjectionLayer(
+  binding: XRGPUBinding,
+  colorFormat: GPUTextureFormat,
+) {
+  const scaleFactor = getXrProjectionScale();
+  console.log('[XR] Projection scale', scaleFactor.toFixed(2), {
+    nativeProjectionScaleFactor: binding.nativeProjectionScaleFactor,
+  });
+  return binding.createProjectionLayer({
+    colorFormat,
+    depthStencilFormat: XR_DEPTH_FORMAT,
+    alphaMode: 'opaque',
+    scaleFactor,
+  });
+}
+
+function applyNativeXrQuality() {
+  if (!shouldUseNativeXrBinding() || !xrSession || !xrGpuBinding || !xrColorFormat) {
+    updateXrStatus();
+    return;
+  }
+
+  xrProjectionLayer = createXrProjectionLayer(xrGpuBinding, xrColorFormat);
+  sessionUpdateRenderState(xrSession, xrProjectionLayer);
+  updateXrStatus();
+}
+
+function sessionUpdateRenderState(
+  session: XRSession,
+  projectionLayer: XRProjectionLayer,
+) {
+  session.updateRenderState({ layers: [projectionLayer] });
 }
 
 async function startXrSession(mode: XRSessionMode) {
@@ -1734,11 +1819,12 @@ async function startXrSession(mode: XRSessionMode) {
 
   try {
     const optionalFeatures: XRSessionFeature[] = ['hand-tracking'];
-    if (!xrWebGpuSupported) {
+    const useNativeXrBinding = shouldUseNativeXrBinding();
+    if (!useNativeXrBinding) {
       optionalFeatures.push('local-floor');
     }
     const sessionInit: XRSessionInit = { optionalFeatures };
-    if (xrWebGpuSupported) {
+    if (useNativeXrBinding) {
       sessionInit.requiredFeatures = ['webgpu'];
     } else {
       sessionInit.optionalFeatures?.push('local-floor');
@@ -1751,7 +1837,7 @@ async function startXrSession(mode: XRSessionMode) {
 
     session.addEventListener('end', onXrSessionEnded);
 
-    if (xrWebGpuSupported) {
+    if (useNativeXrBinding) {
       xrGpuBinding = new XRGPUBinding(session, root.device);
       const preferredColorFormat =
         xrGpuBinding.getPreferredColorFormat() ?? presentationFormat;
@@ -1760,14 +1846,13 @@ async function startXrSession(mode: XRSessionMode) {
         console.log('[XR] Using color format', xrColorFormat);
         xrLoggedFormat = true;
       }
-      const projectionLayer = xrGpuBinding.createProjectionLayer({
-        colorFormat: preferredColorFormat,
-        depthStencilFormat: XR_DEPTH_FORMAT,
-        alphaMode: 'opaque',
-      });
+      const projectionLayer = createXrProjectionLayer(
+        xrGpuBinding,
+        preferredColorFormat,
+      );
       xrProjectionLayer = projectionLayer;
       xrGlLayer = null;
-      session.updateRenderState({ layers: [projectionLayer] });
+      sessionUpdateRenderState(session, projectionLayer);
     } else {
       xrGpuBinding = null;
       xrProjectionLayer = null;
@@ -1789,6 +1874,7 @@ async function startXrSession(mode: XRSessionMode) {
       otherButton.disabled = true;
     }
 
+    updateXrStatus();
     session.requestAnimationFrame(onXrFrame);
   } catch (error) {
     console.error('Failed to start XR session', error);
@@ -1809,6 +1895,7 @@ async function startXrSession(mode: XRSessionMode) {
     commitHandJointUniform(0);
     sliderInputX = eventHandler.currentMouseX;
     handleResize();
+    updateXrStatus();
     if (targetButton) {
       const supported = mode === 'immersive-vr' ? xrVrSupported : xrArSupported;
       const label = mode === 'immersive-vr' ? 'VR' : 'AR';
@@ -1884,6 +1971,7 @@ function onXrSessionEnded() {
   commitHandJointUniform(0);
   sliderInputX = eventHandler.currentMouseX;
   handleResize();
+  updateXrStatus();
   setXrButtonState(
     xrVrButton,
     xrVrSupported ? getXrEnterLabel('VR') : 'VR not supported',
@@ -1958,27 +2046,6 @@ function onXrFrame(time: DOMHighResTimeStamp, frame: XRFrame) {
           depthStoreOp: 'store',
           depthClearValue: 1,
         });
-      }
-
-      if (subImage.viewport) {
-        const vp = subImage.viewport;
-        // Vision Pro packs both eyes into one texture; viewport guards against overlap.
-        // The depth range is left at the default [0,1].
-        const setViewport = (pass as unknown as { setViewport?: Function }).setViewport;
-        if (typeof setViewport === 'function') {
-          setViewport.call(pass, vp.x, vp.y, vp.width, vp.height, 0, 1);
-        }
-        const setScissor = (pass as unknown as { setScissorRect?: Function })
-          .setScissorRect;
-        if (typeof setScissor === 'function') {
-          setScissor.call(
-            pass,
-            vp.x,
-            vp.y,
-            Math.max(0, vp.width),
-            Math.max(0, vp.height),
-          );
-        }
       }
 
       pass.with(bindGroups.rayMarch).draw(3);
@@ -2589,7 +2656,7 @@ async function autoSetQuaility() {
 
 export const controls = {
   'Quality': {
-    initial: 'Auto',
+    initial: 'Low',
     options: [
       'Auto',
       'Very Low',
@@ -2601,8 +2668,9 @@ export const controls = {
     onSelectChange: (value: string) => {
       if (value === 'Auto') {
         autoSetQuaility().then((scale) => {
-          qualityScale = scale;
+          qualityScale = Math.min(scale, XR_PROJECTION_MAX_DEFAULT_SCALE);
           handleResize();
+          applyNativeXrQuality();
         });
         return;
       }
@@ -2617,6 +2685,7 @@ export const controls = {
 
       qualityScale = qualityMap[value] || 0.5;
       handleResize();
+      applyNativeXrQuality();
     },
   },
   'XR Copy Quality (fallback)': {
@@ -2628,6 +2697,18 @@ export const controls = {
         nextIndex >= 0 ? nextIndex : fallbackResolutionIndex,
         isXrFallbackActive(),
       );
+    },
+  },
+  'Use XRGPUBinding': {
+    initial: xrWebGpuSupported,
+    onToggleChange: (v: boolean) => {
+      xrUseNativeBinding = xrWebGpuSupported && v;
+      if (!xrUseNativeBinding && xrSession && xrGpuBinding) {
+        void xrSession.end();
+      }
+      configureXrButton(xrVrButton, xrVrSupported, 'VR', 'immersive-vr');
+      configureXrButton(xrArButton, xrArSupported, 'AR', 'immersive-ar');
+      updateXrStatus();
     },
   },
   'Light dir': {

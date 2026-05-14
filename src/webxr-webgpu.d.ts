@@ -14,12 +14,15 @@ declare global {
   }
 
   interface XRGPUBinding {
+    nativeProjectionScaleFactor?: number;
     getPreferredColorFormat(): GPUTextureFormat | null;
     getViewSubImage(
       layer: XRProjectionLayer,
       view: XRView,
     ): XRGPUViewSubImage;
-    createProjectionLayer(init?: XRProjectionLayerInit): XRProjectionLayer;
+    createProjectionLayer(
+      init?: XRProjectionLayerInit & { scaleFactor?: number },
+    ): XRProjectionLayer;
   }
 
   var XRGPUBinding: {
