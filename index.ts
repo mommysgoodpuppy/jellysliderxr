@@ -70,7 +70,6 @@ if (body.firstChild) {
 }
 
 // Execute example
-// @ts-expect-error
 const example = await import('./src/index.ts');
 
 // Create example controls
@@ -81,7 +80,7 @@ for (const controls of Object.values(example)) {
 
   for (
     const [label, params] of Object.entries(
-      controls as Record<string, ExampleControlParam>,
+      controls as unknown as Record<string, ExampleControlParam>,
     )
   ) {
     if ('onButtonClick' in params) {

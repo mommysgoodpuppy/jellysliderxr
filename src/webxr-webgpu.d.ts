@@ -1,14 +1,15 @@
 export {};
 
 declare global {
-  interface XRSessionInit {
-    optionalFeatures?: (XRSessionFeature | 'hand-tracking')[];
-    requiredFeatures?: (XRSessionFeature | 'hand-tracking')[];
-  }
+  type XRWebGPUProjectionLayerInit =
+    & Omit<XRProjectionLayerInit, 'colorFormat' | 'depthFormat'>
+    & {
+      colorFormat?: GPUTextureFormat;
+      alphaMode?: GPUCanvasAlphaMode;
+    };
 
   interface XRGPUViewSubImage {
     colorTexture: GPUTexture;
-    depthStencilTexture: GPUTexture;
     getViewDescriptor(): GPUTextureViewDescriptor;
     viewport: XRViewport;
   }
@@ -20,9 +21,7 @@ declare global {
       layer: XRProjectionLayer,
       view: XRView,
     ): XRGPUViewSubImage;
-    createProjectionLayer(
-      init?: XRProjectionLayerInit & { scaleFactor?: number },
-    ): XRProjectionLayer;
+    createProjectionLayer(init?: XRWebGPUProjectionLayerInit): XRProjectionLayer;
   }
 
   var XRGPUBinding: {

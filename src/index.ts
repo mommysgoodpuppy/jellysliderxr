@@ -58,6 +58,8 @@ type XrCompatibleGl = WebGL2RenderingContext & {
 };
 const xrWebGpuSupported = 'XRGPUBinding' in window;
 const XR_FALLBACK_LABEL_SUFFIX = ' (copy)';
+const RAY_MARCH_FORMAT: GPUTextureFormat = 'rgba8unorm';
+const CAMERA_JITTER_ENABLED = false;
 const XR_FALLBACK_RESOLUTION_PRESETS = [
   { label: 'Performance', scale: 0.55 },
   { label: 'Balanced', scale: 0.75 },
@@ -65,7 +67,6 @@ const XR_FALLBACK_RESOLUTION_PRESETS = [
 ] as const;
 const XR_COPY_BASE_RESOLUTION = 2048;
 const XR_COPY_MIN_RESOLUTION = 960;
-const XR_PROJECTION_MIN_SCALE = 0.2;
 const XR_PROJECTION_MAX_DEFAULT_SCALE = 0.5;
 let fallbackResolutionIndex = 1;
 
@@ -145,8 +146,8 @@ const XR_HEADSET_DOWN_OFFSET = 0.5;
 let xrUseHeadBasedPosition = false;
 let xrSceneTransformLocked = false;
 let xrSceneTranslation: Vec3Tuple = [...XR_SCENE_TRANSLATION];
-let xrSceneTransform = m.mat4.identity();
-let xrSceneTransformInv = m.mat4.identity();
+let xrSceneTransform: m.Mat4 = m.mat4.identity();
+let xrSceneTransformInv: m.Mat4 = m.mat4.identity();
 
 function setXrSceneTransformFromTranslation(translation: Vec3Tuple) {
   xrSceneTranslation = translation;
@@ -162,11 +163,11 @@ function setXrSceneTransformFromTranslation(translation: Vec3Tuple) {
     xrTranslationMatrix,
     xrScaleMatrix,
     m.mat4.identity(),
-  );
-  xrSceneTransformInv = m.mat4.invert(
+  ) as m.Mat4;
+  xrSceneTransformInv = (m.mat4.invert(
     xrSceneTransform,
     m.mat4.identity(),
-  ) ?? m.mat4.identity();
+  ) ?? m.mat4.identity()) as m.Mat4;
 }
 
 setXrSceneTransformFromTranslation(xrSceneTranslation);
@@ -200,7 +201,6 @@ const XR_HAND_JOINTS: XRHandJoint[] = [
   'pinky-finger-tip',
 ];
 const XR_HAND_CAPTURE_RADIUS = 0.12;
-const XR_HAND_RELEASE_RADIUS = 0.18;
 const XR_HAND_APPROACH_MIN = 0.12;
 const XR_HAND_APPROACH_MAX = 0.45;
 const XR_HAND_VISUAL_SCALE = 6.0;
@@ -266,7 +266,7 @@ const jellyColorUniform = root.createUniform(
   d.vec4f(1.0, 0.45, 0.075, 1.0),
 );
 
-const randomUniform = root.createUniform(d.vec2f);
+const randomUniform = root.createUniform(d.vec2f, d.vec2f(0.754877, 0.56984));
 const blurEnabledUniform = root.createUniform(d.u32);
 const interactionOnlyUniform = root.createUniform(d.u32, d.u32(0));
 const interactionPlaneUniform = root.createUniform(
@@ -613,7 +613,7 @@ const getFakeShadow = (
 
   if (position.y < -GroundParams.groundThickness) {
     // Applying darkening under the ground (the shadow cast by the upper ground layer)
-    const fadeSharpness = 30.0;
+    const fadeSharpness = d.f32(30);
     const inset = 0.02;
     const cutout = rectangleCutoutDist(position.xz) + inset;
     const edgeDarkening = std.saturate(1 - cutout * fadeSharpness);
@@ -650,7 +650,7 @@ const getFakeShadow = (
 
     const contrast = 20 * std.saturate(finalUV.y) * (0.8 + endCapX * 0.2);
     const shadowOffset = -0.3;
-    const featherSharpness = 10.0;
+    const featherSharpness = d.f32(10);
     const uvEdgeFeather = std.saturate(finalUV.x * featherSharpness) *
       std.saturate((1 - finalUV.x) * featherSharpness) *
       std.saturate((1 - finalUV.y) * featherSharpness) *
@@ -985,7 +985,7 @@ const renderHandJoint = (
   return d.vec4f(std.saturate(litColor.add(glow)), 1.0);
 };
 
-const rayMarch = (rayOrigin: d.v3f, rayDirection: d.v3f, uv: d.v2f) => {
+const rayMarch = (rayOrigin: d.v3f, rayDirection: d.v3f) => {
   'use gpu';
   let totalSteps = d.u32();
 
@@ -1137,7 +1137,6 @@ const raymarchFn = tgpu['~unstable'].fragmentFn({
   const color = rayMarch(
     ray.origin,
     ray.direction,
-    uv,
   );
   return d.vec4f(std.tanh(color.xyz.mul(1.3)), 1);
 });
@@ -1153,8 +1152,6 @@ const fragmentMain = tgpu['~unstable'].fragmentFn({
   );
 });
 
-const RAY_MARCH_FORMAT: GPUTextureFormat = 'rgba8unorm';
-const XR_DEPTH_FORMAT: GPUTextureFormat = 'depth24plus';
 const rayMarchPipelines = new Map<
   GPUTextureFormat,
   ReturnType<typeof createRayMarchPipeline>
@@ -1215,11 +1212,13 @@ function getActiveQualityScale() {
   return qualityScale;
 }
 
-function getXrProjectionScale() {
-  return Math.max(
-    XR_PROJECTION_MIN_SCALE,
-    Math.min(1, qualityScale),
-  );
+function getXrProjectionScale(binding: XRGPUBinding | null = xrGpuBinding) {
+  const nativeScale = binding?.nativeProjectionScaleFactor;
+  return typeof nativeScale === 'number' &&
+      Number.isFinite(nativeScale) &&
+      nativeScale > 0
+    ? nativeScale
+    : 1;
 }
 
 function getXrPathLabel() {
@@ -1247,7 +1246,7 @@ function updateXrStatus() {
     ? `active ${activeXrMode === 'immersive-ar' ? 'AR' : 'VR'}`
     : 'not presenting';
   const qualityLabel = shouldUseNativeXrBinding()
-    ? `XR scale ${Math.round(getXrProjectionScale() * 100)}%`
+    ? `XR native scale ${Math.round(getXrProjectionScale() * 100)}%`
     : `copy scale ${Math.round(fallbackQualityScale * 100)}%`;
   xrStatusElement.textContent = `${pathLabel} · ${qualityLabel} · ${sessionLabel}`;
 }
@@ -1295,10 +1294,6 @@ function getDeltaSeconds(timestamp: number) {
 }
 
 function updateSimulation(deltaTime: number, overrideDragX?: number | null) {
-  randomUniform.write(
-    d.vec2f((Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2),
-  );
-
   eventHandler.update();
 
   if (typeof overrideDragX === 'number') {
@@ -1317,7 +1312,9 @@ function render(timestamp: number) {
   }
 
   frameCount++;
-  camera.jitter();
+  if (CAMERA_JITTER_ENABLED) {
+    camera.jitter();
+  }
   const deltaTime = getDeltaSeconds(timestamp);
   updateSimulation(deltaTime);
 
@@ -1763,13 +1760,12 @@ function createXrProjectionLayer(
   binding: XRGPUBinding,
   colorFormat: GPUTextureFormat,
 ) {
-  const scaleFactor = getXrProjectionScale();
+  const scaleFactor = getXrProjectionScale(binding);
   console.log('[XR] Projection scale', scaleFactor.toFixed(2), {
     nativeProjectionScaleFactor: binding.nativeProjectionScaleFactor,
   });
   return binding.createProjectionLayer({
     colorFormat,
-    depthStencilFormat: XR_DEPTH_FORMAT,
     alphaMode: 'opaque',
     scaleFactor,
   });
@@ -1818,7 +1814,7 @@ async function startXrSession(mode: XRSessionMode) {
   }
 
   try {
-    const optionalFeatures: XRSessionFeature[] = ['hand-tracking'];
+    const optionalFeatures: string[] = ['hand-tracking'];
     const useNativeXrBinding = shouldUseNativeXrBinding();
     if (!useNativeXrBinding) {
       optionalFeatures.push('local-floor');
@@ -2028,27 +2024,15 @@ function onXrFrame(time: DOMHighResTimeStamp, frame: XRFrame) {
       const subImage = xrGpuBinding.getViewSubImage(xrProjectionLayer, view);
       const viewDescriptor = subImage.getViewDescriptor();
       const colorView = subImage.colorTexture.createView(viewDescriptor);
-      const depthTexture = subImage.depthStencilTexture ?? null;
-      const depthView = depthTexture
-        ? depthTexture.createView(viewDescriptor)
-        : null;
 
-      const pass = xrPipeline.withColorAttachment({
-        view: colorView,
-        loadOp: 'clear',
-        storeOp: 'store',
-      });
-
-      if (depthView) {
-        pass.withDepthStencilAttachment({
-          view: depthView,
-          depthLoadOp: 'clear',
-          depthStoreOp: 'store',
-          depthClearValue: 1,
-        });
-      }
-
-      pass.with(bindGroups.rayMarch).draw(3);
+      xrPipeline
+        .withColorAttachment({
+          view: colorView,
+          loadOp: 'clear',
+          storeOp: 'store',
+        })
+        .with(bindGroups.rayMarch)
+        .draw(3);
     }
     return;
   }
@@ -2618,8 +2602,10 @@ async function autoSetQuaility() {
     });
 
   for (let i = 0; i < 8; i++) {
+    const testWidth = canvas.width * resolutionScale;
+    const testHeight = canvas.height * resolutionScale;
     const testTexture = root['~unstable'].createTexture({
-      size: [canvas.width * resolutionScale, canvas.height * resolutionScale],
+      size: [testWidth, testHeight],
       format: 'rgba8unorm',
     }).$usage('render');
 
@@ -2692,7 +2678,9 @@ export const controls = {
     initial: getFallbackQualityLabel(),
     options: fallbackQualityOptions,
     onSelectChange: (value: string) => {
-      const nextIndex = fallbackQualityOptions.indexOf(value);
+      const nextIndex = (fallbackQualityOptions as readonly string[]).indexOf(
+        value,
+      );
       applyFallbackResolution(
         nextIndex >= 0 ? nextIndex : fallbackResolutionIndex,
         isXrFallbackActive(),
